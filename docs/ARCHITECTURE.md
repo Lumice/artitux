@@ -9,9 +9,9 @@ is about the *code*.
 
 | Crate | Directory | What it is |
 | --- | --- | --- |
-| `linuwux-rust` (`linuwux`) | `protocol/` | The safe core: `no_std`, `#![forbid(unsafe_code)]`, unit-tested. Pure decision logic — CPUID reply tables, KUSER patch recipes, the Reflex registration/routing state machine, string parsing for environment/gamescope detection. No libc, no signals, no process memory. |
-| `linuwux-runtime` | `runtime/` | The unsafe shell. Drives `protocol/`'s logic through the `Host` trait pattern (see `protocol/reflex/state.rs`) and calls its pure functions directly elsewhere. Owns every signal handler, every libc interposition, every `mprotect`/`process_vm_readv` call. Feature-gated per module (see `runtime/Cargo.toml`) so CI can build and lint every supported subset. |
-| `xtask` | `xtask/` | The build tool. Links `linuwux-runtime` into `LinUwUx.so` with an explicit export map and linker hardening, then verifies the result (exported symbols, ELF properties, `.init_array` constructor order). This verification is the actual safety net for structural changes: a bad rename or a dropped `#[no_mangle]` fails the build, not just a review. |
+| `artitux-rust` (`artitux`) | `protocol/` | The safe core: `no_std`, `#![forbid(unsafe_code)]`, unit-tested. Pure decision logic — CPUID reply tables, KUSER patch recipes, the Reflex registration/routing state machine, string parsing for environment/gamescope detection. No libc, no signals, no process memory. |
+| `artitux-runtime` | `runtime/` | The unsafe shell. Drives `protocol/`'s logic through the `Host` trait pattern (see `protocol/reflex/state.rs`) and calls its pure functions directly elsewhere. Owns every signal handler, every libc interposition, every `mprotect`/`process_vm_readv` call. Feature-gated per module (see `runtime/Cargo.toml`) so CI can build and lint every supported subset. |
+| `xtask` | `xtask/` | The build tool. Links `artitux-runtime` into `Artitux.so` with an explicit export map and linker hardening, then verifies the result (exported symbols, ELF properties, `.init_array` constructor order). This verification is the actual safety net for structural changes: a bad rename or a dropped `#[no_mangle]` fails the build, not just a review. |
 
 Why the split: code that never touches a raw pointer or a syscall can be
 tested with plain `cargo test`, reasoned about without thinking about signal
@@ -28,29 +28,35 @@ Each `.init_array`-registered module owns one concern and runs its own setup
 constructor at process start (see the `link_section = ".init_array.NNNNN"`
 statics — the number fixes their relative order, verified by `xtask`):
 
-- **`environment.rs`** — runs first. Decides whether this process is the
-  game's own `.exe`, forces native DLL overrides if so, and triggers
-  `registry.rs`.
-- **`debug.rs`** — `LINUWUX_DEBUG`/`LINUWUX_LOG` handling; every other
-  module's logging goes through its C ABI.
-- **`gamescope.rs`** — detects a Gamescope session and keeps LinUwUx's
-  `LD_PRELOAD` entry alive across Gamescope's re-exec.
+- **`debug.rs`** — runs first (`.init_array.00102`); `ARTITUX_DEBUG`/`ARTITUX_LOG`
+  handling; every other module's logging goes through its C ABI.
+- **`gamescope.rs`** — detects a Gamescope session (`.init_array.00103`) and
+  keeps Artitux's `LD_PRELOAD` entry alive across Gamescope's re-exec.
+- **`environment.rs`** — decides whether this process is the game's own
+  `.exe`, forces native DLL overrides if so, and triggers `registry.rs`.
+- **`config.rs`** — startup-only environment flags (`ARTITUX_LEGACY_PROFILE`,
+  `ARTITUX_RESOLVER_BRIDGE`, `ARTITUX_ARTIFACT_NATIVE_STUBS`).
 - **`faketime.rs`** — the `gettimeofday` clock offset Reflex's `SET_TIME`
   control leaf sets.
-- **`hooks.rs`** — signal interposition that keeps LinUwUx's `SIGSEGV`/`SIGSYS`
+- **`hooks.rs`** — signal interposition that keeps Artitux's `SIGSEGV`/`SIGSYS`
   handlers ahead of Wine's own, plus the opt-in indexed `win32u` duplicate-`free`
   guard in `hooks/pending_frees.rs`.
 - **`kuser.rs`** — owns the live `KUSER_SHARED_DATA` page: applies patch
   recipes from `protocol/kuser.rs`, and (legacy, being phased out — see
-  `docs/protocol/topspin-investigation.md`) the `LINUWUX_SYSCALL_HACK` flag.
+  `docs/protocol/topspin-investigation.md`) the `ARTITUX_SYSCALL_HACK` flag.
 - **`cpuid.rs`** — the SIGSEGV/CPUID trap handler: per-caller Reflex-image
-  detection, native CPUID pass-through, reply selection via
-  `protocol/cpuid.rs`.
+  detection, native CPUID pass-through, reply selection via `protocol/cpuid.rs`
+  and `protocol/artifact*.rs`.
 - **`reflex.rs`** — the C ABI into `protocol/reflex/state.rs::State`, and
   `RuntimeHost`, the seam where the safe core's decisions become real
   `mprotect`/logging/presentation side effects.
-- **`syscall/`** — the SIGSYS boundary; see below, it's the largest and most
-  actively-developed part of the runtime.
+- **`artifact.rs` / `artifact_entry.rs` / `artifact_kuser.rs` /
+  `artifact_loader.rs` / `peb_heaps.rs` / `resolver.rs` / `resolver.S`** —
+  preload-only Artifact runtime: capabilities detection, KUSER private clock
+  worker, loader/PEB heap adoption, and native unwind/resolver bridge.
+- **`syscall/`** — the SIGSYS boundary (`sigsys_router.rs`, `kuser_dispatch.rs`,
+  `reflex_markers.rs`, `int2e.rs`, `pe_stub_layout.rs`, `unixlib_repair.rs`,
+  `artifact_flags.rs`, `mem.rs`); see below.
 - **`registry.rs`** — writes a `HwProfileGuid` key into the Wine prefix's
   registry on first run.
 
@@ -59,7 +65,7 @@ statics — the number fixes their relative order, verified by `xtask`):
 This is the part `docs/protocol/syscall-routing.md` describes in protocol
 terms; in source it's three independent stages plus two unrelated fixups:
 
-1. **`kuser_dispatch.rs`** — installs LinUwUx's handler in Wine's KUSER
+1. **`kuser_dispatch.rs`** — installs Artitux's handler in Wine's KUSER
    dispatcher slot (a hand-written naked-asm trampoline, `dispatcher_bridge`,
    with a private stack per Windows thread id) and classifies every call
    that arrives through it: is this evidenced as Reflex's own copied syscall

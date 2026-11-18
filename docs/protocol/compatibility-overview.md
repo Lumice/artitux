@@ -1,28 +1,30 @@
-# What LinUwUx + Reflex are, and are not
+# What Artitux + Reflex are, and are not
 
-LinUwUx and its companion Reflex client are compatibility tools for running
+Artitux and its companion Reflex client are compatibility tools for running
 some legitimately-owned, Denuvo-protected games on Linux. Denuvo-protected
 games often fail under Wine because of environment mismatches Wine doesn't
 reproduce by default (CPU identity, page/shared-data layout, syscall
-dispatch shape). LinUwUx does not crack or bypass Denuvo: Denuvo's own
-license tokens are still required and still enforced by the game; LinUwUx
+dispatch shape). Artitux does not crack or bypass Denuvo: Denuvo's own
+license tokens are still required and still enforced by the game; Artitux
 only makes the surrounding Linux/Wine environment look enough like Windows
 that the protection's own checks pass instead of misfiring.
 
-Reflex plus LinUwUx route the syscalls a title's protection depends on to a
+Reflex plus Artitux route the syscalls a title's protection depends on to a
 handler that supplies the arguments the protection expects, rather than
 letting a Wine/Linux mismatch present the wrong values and crash or corrupt
 game state.
 
 ## Current compatibility status
 
-As of this writing: ACBFR, BGE, FC6, NFSPB, TopSpin, SMT5V, Hatsune Miku,
-LADPYIH, and BL4 are working with LinUwUx and Reflex. BL4's status is based
-on current gameplay testing; BL4-1.10 has not been separately confirmed.
-See [`game-quirks.md`](game-quirks.md) for the protocol differences recorded
-for the other titles.
+For titles confirmed on Artitux itself, see [COMPATIBILITY.md](../COMPATIBILITY.md)
+and the root [README.md](../../README.md#confirmed-titles).
 
-## Status of `LINUWUX_SYSCALL_HACK`
+Upstream LinUwUx previously recorded these Reflex-based titles: ACBFR, BGE, FC6,
+NFSPB, TopSpin, SMT5V, Hatsune Miku, LADPYIH, and BL4. See
+[`game-quirks.md`](game-quirks.md) for the recorded protocol differences;
+upstream-only Reflex titles are not currently supported or verified on Artitux.
+
+## Status of `ARTITUX_SYSCALL_HACK`
 
 **Still active in the shipped runtime** (`runtime/src/kuser.rs` writes
 `KUSER_SHARED_DATA.SystemCall = 0` for the game process when this is set).
@@ -37,6 +39,5 @@ hardware.
 An additional UMIP-related issue is tracked separately: with UMIP enabled,
 some titles can't run at all on Linux, because the kernel returns a dummy
 GDTR limit where the game expects `0x7f`. No fix has landed for this from
-within LinUwUx yet. See [`umip.md`](umip.md) for the verified unprivileged
-pre-execution trap and the remaining site-coverage problem; syscall IAT
-evidence alone does not intercept SGDT.
+within Artitux yet; host workarounds are documented in the root
+[README.md](../../README.md#cpu-and-kernel-prerequisites).

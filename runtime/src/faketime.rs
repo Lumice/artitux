@@ -7,11 +7,11 @@
 //! over a small socketpair rather than kept purely in a local atomic — see
 //! `init_socketpair()`. The offset arithmetic itself
 //! (FILETIME-to-Unix-seconds) is in the safe core, `protocol/faketime.rs`.
+use artitux::faketime::{apply_offset, offset_from_filetime};
 use core::ffi::{c_char, c_int, c_void};
 use core::mem::{MaybeUninit, size_of};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use linuwux::faketime::{apply_offset, offset_from_filetime};
 
 // 1337 is outside the default max file descriptors :(
 const OFFSET_RECV_FD: c_int = 67;
@@ -279,11 +279,11 @@ pub extern "C" fn set_offset(filetime: u64) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn linuwux_setup_faketime() {
+pub extern "C" fn artitux_setup_faketime() {
     let _ = resolve_real_gettimeofday();
     init_socketpair();
 }
 
 #[used]
 #[unsafe(link_section = ".init_array.00202")]
-static INITIALIZE: extern "C" fn() = linuwux_setup_faketime;
+static INITIALIZE: extern "C" fn() = artitux_setup_faketime;

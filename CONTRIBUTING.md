@@ -1,13 +1,13 @@
-# Contributing to LinUwUx
+# Contributing to Artitux
 
-Thanks for helping improve LinUwUx. Small, focused contributions are easiest
+Thanks for helping improve Artitux. Small, focused contributions are easiest
 to review and safest to test in a runtime that interposes low-level Wine and
 Proton behaviour.
 
 ## Before You Start
 
 - Search existing issues before opening a new one.
-- Use the [bug-report form](https://github.com/brcly/linuwux-runtime/issues/new?template=bug_report.yml)
+- Use the [bug-report form](https://github.com/Lumice/artitux/issues/new?template=bug_report.yml)
   for compatibility problems.
 - Discuss substantial features, protocol changes, or behaviour changes in an
   issue before writing the implementation.

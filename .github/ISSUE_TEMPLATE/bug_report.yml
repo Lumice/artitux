@@ -9,9 +9,9 @@ body:
       value: |
         Please complete every required field and attach the requested logs. Reports without enough diagnostic information may not be actionable.
 
-        To create a LinUwUx log in Steam, add `LINUWUX_DEBUG=1 LINUWUX_LOG=/tmp/linuwux.log` before the existing launch options. For example: `LINUWUX_DEBUG=1 LINUWUX_LOG=/tmp/linuwux.log linuwux %command%`.
+        To create an Artitux log in Steam, add `ARTITUX_DEBUG=1 ARTITUX_LOG=/tmp/artitux.log` before the existing launch options. For example: `ARTITUX_DEBUG=1 ARTITUX_LOG=/tmp/artitux.log artitux %command%`.
 
-        In another launcher, add `LINUWUX_DEBUG=1` and `LINUWUX_LOG=/tmp/linuwux.log` through its environment or launch-arguments settings.
+        In another launcher, add `ARTITUX_DEBUG=1` and `ARTITUX_LOG=/tmp/artitux.log` through its environment or launch-arguments settings.
 
         Add `PROTON_LOG=1` to the same launch options to create Steam's `steam-APPID.log` in your home directory. Other launchers provide their own output or log viewer.
 
@@ -24,7 +24,7 @@ body:
       options:
         - label: I searched existing open and closed issues for this problem.
           required: true
-        - label: I tested the game without LinUwUx and recorded the result below.
+        - label: I tested the game without Artitux and recorded the result below.
           required: true
         - label: I reviewed the attached logs and removed private or sensitive information.
           required: true
@@ -45,7 +45,7 @@ body:
       description: Include every item listed in the placeholder.
       placeholder: |
         Game and store:
-        LinUwUx version, release tag, or installed library SHA-256:
+        Artitux version, release tag, or installed library SHA-256:
         Installation method:
         Launcher and launcher version:
         Proton/Wine name and version:
@@ -94,11 +94,11 @@ body:
       required: true
 
   - type: textarea
-    id: linuwux_log
+    id: artitux_log
     attributes:
-      label: LinUwUx debug log
-      description: Drag `/tmp/linuwux.log` into this field. If GitHub rejects the extension, rename it to `.txt` or place it in a zip archive. If no file was created, write `Log was not created` and explain where startup stopped.
-      placeholder: Drag the LinUwUx log file here; do not paste only the last few lines.
+      label: Artitux debug log
+      description: Drag `/tmp/artitux.log` into this field. If GitHub rejects the extension, rename it to `.txt` or place it in a zip archive. If no file was created, write `Log was not created` and explain where startup stopped.
+      placeholder: Drag the Artitux log file here; do not paste only the last few lines.
     validations:
       required: true
 

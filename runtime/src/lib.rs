@@ -1,10 +1,10 @@
-//! LinUwUx's unsafe runtime shell: the libc/signal/syscall interposition
-//! that drives the safe `linuwux` (`protocol/`) crate's decision logic. Each
+//! Artitux's unsafe runtime shell: the libc/signal/syscall interposition
+//! that drives the safe `artitux` (`protocol/`) crate's decision logic. Each
 //! module here is feature-gated independently (see the `[features]` table
 //! in `Cargo.toml`) so `xtask` and CI can build and lint every supported
 //! subset; `docs/ARCHITECTURE.md` has the full module map and
 //! `docs/protocol/` has the protocol design each module implements.
-//! Compiled to a static library and linked into `LinUwUx.so` by `xtask`,
+//! Compiled to a static library and linked into `Artitux.so` by `xtask`,
 //! with the exported C ABI surface and linker hardening it verifies.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::missing_safety_doc)]
@@ -22,7 +22,7 @@ fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
     target_env = "gnu",
     target_pointer_width = "64"
 )))]
-compile_error!("linuwux-runtime requires Linux x86_64 with glibc and 64-bit pointers");
+compile_error!("artitux-runtime requires Linux x86_64 with glibc and 64-bit pointers");
 
 #[cfg(any(feature = "cpuid", feature = "faketime"))]
 mod clock;
@@ -41,6 +41,19 @@ mod maps;
 mod page_guard;
 #[cfg(any(feature = "cpuid", feature = "syscall"))]
 mod procmem;
+
+#[cfg(feature = "artifact")]
+mod artifact;
+#[cfg(feature = "artifact")]
+mod artifact_entry;
+#[cfg(feature = "artifact")]
+mod artifact_kuser;
+#[cfg(feature = "artifact")]
+mod artifact_loader;
+#[cfg(feature = "artifact")]
+mod peb_heaps;
+#[cfg(feature = "artifact")]
+mod resolver;
 
 #[cfg(feature = "cpuid")]
 pub mod cpuid;

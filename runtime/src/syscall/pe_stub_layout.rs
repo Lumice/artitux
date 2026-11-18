@@ -24,7 +24,7 @@
 //!
 //! Active for the whole session in the selected game process; no environment
 //! variable is required. Each rewrite is logged once per file when
-//! `LINUWUX_DEBUG=1` is set, capped at [`LOG_LIMIT`] events.
+//! `ARTITUX_DEBUG=1` is set, capped at [`LOG_LIMIT`] events.
 
 // File-backed mmap integration tests are native-only, leaving this path unused in Miri.
 #![cfg_attr(miri, allow(dead_code))]
@@ -243,6 +243,14 @@ pub unsafe extern "C" fn pread(
 /// required by the completed read operation.
 #[cfg(not(test))]
 unsafe fn after_file_read(fd: c_int, buffer: *mut c_void, result: isize) {
+    #[cfg(feature = "artifact")]
+    if !artifact_rewrite_policy(
+        crate::config::artifact_native_stubs(),
+        crate::artifact_kuser::ready(),
+    ) {
+        return;
+    }
+
     if result < MIN_FILE_READ {
         return;
     }
@@ -344,6 +352,10 @@ pub unsafe extern "C" fn mmap(
             unsafe { after_file_map(fd, result, length, prot, real) };
         }
     }
+    #[cfg(feature = "artifact")]
+    if result != libc::MAP_FAILED {
+        crate::resolver::observe(result as usize, prot, fd, offset);
+    }
     result
 }
 
@@ -433,6 +445,14 @@ unsafe fn after_image_map(
     prot: c_int,
     offset: libc::off_t,
 ) {
+    #[cfg(feature = "artifact")]
+    if !artifact_rewrite_policy(
+        crate::config::artifact_native_stubs(),
+        crate::artifact_kuser::ready(),
+    ) {
+        return;
+    }
+
     let _errno = crate::errno::Errno::save();
     #[cfg(feature = "environment")]
     if !crate::environment::game_process() {
@@ -509,6 +529,14 @@ unsafe fn after_file_map(
     prot: c_int,
     real_mmap: *mut c_void,
 ) {
+    #[cfg(feature = "artifact")]
+    if !artifact_rewrite_policy(
+        crate::config::artifact_native_stubs(),
+        crate::artifact_kuser::ready(),
+    ) {
+        return;
+    }
+
     let _errno = crate::errno::Errno::save();
     #[cfg(feature = "environment")]
     if !crate::environment::game_process() {
@@ -627,6 +655,39 @@ unsafe fn fd_path(fd: c_int, path: &mut [u8; 256]) -> usize {
     length as usize
 }
 
+#[cfg(feature = "debug")]
+const SYSTEM_DLL_MAP_LOG_LIMIT: u64 = 64;
+#[cfg(feature = "debug")]
+const SYSTEM_DLL_READ_LOG_LIMIT: u64 = 32;
+
+/// Returns the resolved path length only when the trace budget is available
+/// and the FD resolves to `ntdll.dll` or `win32u.dll`. Checks the budget first
+/// so exhausted tracing does not pay `/proc/self/fd` `readlink` syscalls,
+/// then claims a slot atomically after matching.
+#[cfg(feature = "debug")]
+fn claim_system_dll_trace<F>(
+    events: &AtomicU64,
+    limit: u64,
+    path: &mut [u8; 256],
+    resolve_path: F,
+) -> Option<usize>
+where
+    F: FnOnce(&mut [u8; 256]) -> usize,
+{
+    if events.load(Ordering::Relaxed) >= limit {
+        return None;
+    }
+    let length = resolve_path(path);
+    let path_bytes = &path[..length];
+    if !(path_bytes.ends_with(b"/ntdll.dll") || path_bytes.ends_with(b"/win32u.dll")) {
+        return None;
+    }
+    if events.fetch_add(1, Ordering::Relaxed) >= limit {
+        return None;
+    }
+    Some(length)
+}
+
 /// Bounded trace of every file mapping of `ntdll.dll`/`win32u.dll` in the game
 /// process, with the mapping's protection and flags. This shows how
 /// anti-tamper code obtains its copy of a system DLL (read, data view, image
@@ -651,14 +712,19 @@ unsafe fn trace_system_dll_map(
     if !crate::environment::game_process() {
         return;
     }
-    let _errno = crate::errno::Errno::save();
-    let mut path = [0u8; 256];
-    let length_of_path = unsafe { fd_path(fd, &mut path) };
-    let path_bytes = &path[..length_of_path];
-    if !(path_bytes.ends_with(b"/ntdll.dll") || path_bytes.ends_with(b"/win32u.dll")) {
+    if MAP_EVENTS.load(Ordering::Relaxed) >= SYSTEM_DLL_MAP_LOG_LIMIT {
         return;
     }
-    if MAP_EVENTS.fetch_add(1, Ordering::Relaxed) >= 64 {
+    let _errno = crate::errno::Errno::save();
+    let mut path = [0u8; 256];
+    if claim_system_dll_trace(
+        &MAP_EVENTS,
+        SYSTEM_DLL_MAP_LOG_LIMIT,
+        &mut path,
+        |buf| unsafe { fd_path(fd, buf) },
+    )
+    .is_none()
+    {
         return;
     }
     unsafe {
@@ -691,14 +757,19 @@ unsafe fn trace_system_dll_read(
     if !crate::environment::game_process() {
         return;
     }
-    let _errno = crate::errno::Errno::save();
-    let mut path = [0u8; 256];
-    let length_of_path = unsafe { fd_path(fd, &mut path) };
-    let path_bytes = &path[..length_of_path];
-    if !(path_bytes.ends_with(b"/ntdll.dll") || path_bytes.ends_with(b"/win32u.dll")) {
+    if READ_EVENTS.load(Ordering::Relaxed) >= SYSTEM_DLL_READ_LOG_LIMIT {
         return;
     }
-    if READ_EVENTS.fetch_add(1, Ordering::Relaxed) >= 32 {
+    let _errno = crate::errno::Errno::save();
+    let mut path = [0u8; 256];
+    if claim_system_dll_trace(
+        &READ_EVENTS,
+        SYSTEM_DLL_READ_LOG_LIMIT,
+        &mut path,
+        |buf| unsafe { fd_path(fd, buf) },
+    )
+    .is_none()
+    {
         return;
     }
     unsafe {
@@ -958,7 +1029,7 @@ mod tests {
     #[test]
     fn data_view_gets_windows_tails_without_touching_the_file() {
         let image = fake_dll(0x8000, &[0x1000, 0x2400]);
-        let path = std::env::temp_dir().join(format!("linuwux-pe-view-{}.dll", std::process::id()));
+        let path = std::env::temp_dir().join(format!("artitux-pe-view-{}.dll", std::process::id()));
         std::fs::File::create(&path)
             .unwrap()
             .write_all(&image)
@@ -996,7 +1067,7 @@ mod tests {
     #[cfg(not(miri))]
     #[test]
     fn data_view_of_a_non_pe_or_clean_file_is_left_mapped_as_is() {
-        let path = std::env::temp_dir().join(format!("linuwux-not-pe-{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("artitux-not-pe-{}.bin", std::process::id()));
         let mut data = fake_dll(0x8000, &[0x1000]);
         data[0] = b'X';
         std::fs::File::create(&path)
@@ -1076,5 +1147,105 @@ mod tests {
         assert_eq!(pe_size_of_image(&header), Some(0xb9000));
         assert_eq!(pe_size_of_image(&header[..0x40]), None);
         let _ = &IMAGE_COPIES;
+    }
+
+    #[cfg(feature = "debug")]
+    #[test]
+    fn system_dll_trace_skips_path_resolution_after_budget_and_keeps_atomic_claim() {
+        use super::{SYSTEM_DLL_MAP_LOG_LIMIT, SYSTEM_DLL_READ_LOG_LIMIT, claim_system_dll_trace};
+        use core::sync::atomic::Ordering;
+
+        let write_path = |buf: &mut [u8; 256], src: &[u8]| {
+            buf[..src.len()].copy_from_slice(src);
+            src.len()
+        };
+
+        let map_events = AtomicU64::new(0);
+        let read_events = AtomicU64::new(0);
+        let mut path = [0u8; 256];
+
+        // Non-matching paths do not consume budget.
+        let mut lookups = 0usize;
+        assert_eq!(
+            claim_system_dll_trace(&read_events, SYSTEM_DLL_READ_LOG_LIMIT, &mut path, |buf| {
+                lookups += 1;
+                write_path(buf, b"/tmp/unrelated.dll")
+            }),
+            None
+        );
+        assert_eq!(lookups, 1);
+        assert_eq!(read_events.load(Ordering::Relaxed), 0);
+
+        // Read budget allows 32 matching events, independent of map budget.
+        for index in 0..SYSTEM_DLL_READ_LOG_LIMIT {
+            let src = if index % 2 == 0 {
+                b"/system32/ntdll.dll".as_slice()
+            } else {
+                b"/system32/win32u.dll".as_slice()
+            };
+            assert!(
+                claim_system_dll_trace(&read_events, SYSTEM_DLL_READ_LOG_LIMIT, &mut path, |buf| {
+                    write_path(buf, src)
+                })
+                .is_some()
+            );
+        }
+        assert_eq!(
+            read_events.load(Ordering::Relaxed),
+            SYSTEM_DLL_READ_LOG_LIMIT
+        );
+        assert_eq!(map_events.load(Ordering::Relaxed), 0);
+
+        // Once exhausted, resolve_path must not be invoked at all.
+        let mut post_budget_lookups = 0usize;
+        for candidate in [
+            b"/system32/ntdll.dll".as_slice(),
+            b"/tmp/other.dll".as_slice(),
+        ] {
+            assert_eq!(
+                claim_system_dll_trace(&read_events, SYSTEM_DLL_READ_LOG_LIMIT, &mut path, |buf| {
+                    post_budget_lookups += 1;
+                    write_path(buf, candidate)
+                }),
+                None
+            );
+        }
+        assert_eq!(post_budget_lookups, 0);
+
+        // Concurrent race: another thread claims the last map slot during resolve_path.
+        map_events.store(SYSTEM_DLL_MAP_LOG_LIMIT - 1, Ordering::Relaxed);
+        assert_eq!(
+            claim_system_dll_trace(&map_events, SYSTEM_DLL_MAP_LOG_LIMIT, &mut path, |buf| {
+                map_events.fetch_add(1, Ordering::Relaxed);
+                write_path(buf, b"/system32/ntdll.dll")
+            }),
+            None
+        );
+        assert_eq!(
+            claim_system_dll_trace(&map_events, SYSTEM_DLL_MAP_LOG_LIMIT, &mut path, |_| {
+                panic!("path lookup must be skipped after concurrent exhaustion")
+            }),
+            None
+        );
+    }
+}
+
+#[cfg(feature = "artifact")]
+fn artifact_rewrite_policy(native_stubs: bool, prepared: bool) -> bool {
+    !(native_stubs && prepared)
+}
+
+#[cfg(all(test, feature = "artifact"))]
+mod artifact_rewrite_tests {
+    #[test]
+    fn prepared_artifact_can_opt_out_without_changing_other_modes() {
+        for (opted, prepared, expected) in [
+            (false, false, true),
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert_eq!(super::artifact_rewrite_policy(opted, prepared), expected);
+        }
     }
 }

@@ -11,6 +11,8 @@
 
 #[cfg(all(feature = "kuser", feature = "cpuid"))]
 use libc::ucontext_t;
+#[cfg(feature = "artifact")]
+mod artifact_flags;
 
 #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
 mod diagnostics;
@@ -50,4 +52,10 @@ pub(crate) fn register_reflex_dispatch_handler(handler: u64) {
 #[cfg(all(feature = "kuser", feature = "reflex"))]
 pub(crate) fn install_wine_syscall_dispatcher_bridge() -> bool {
     kuser_dispatch::install()
+}
+
+/// Ordinary-context maintenance after a successfully returned Artifact client.
+#[cfg(feature = "artifact")]
+pub(crate) fn repair_completed_artifact_exports() -> usize {
+    unixlib_repair::repair_completed_artifact_exports()
 }

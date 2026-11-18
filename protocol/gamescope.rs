@@ -2,7 +2,7 @@
 //! path, desktop-session env vars, or process ancestry) and for the
 //! `LD_PRELOAD`/`PPid:` string parsing that detection needs.
 //! `runtime/src/gamescope.rs` owns actually reading `/proc`, walking process
-//! ancestry, and interposing `setenv`/`unsetenv` so LinUwUx's own
+//! ancestry, and interposing `setenv`/`unsetenv` so Artitux's own
 //! `LD_PRELOAD` entry survives Gamescope re-exec.
 pub const ANCESTRY_LIMIT: usize = 64;
 

@@ -5,10 +5,10 @@
 //! logging side effects. `cpuid.rs` calls [`reflex_handle_cpuid`] from the
 //! CPUID trap handler; `syscall/sigsys_router.rs` calls
 //! [`reflex_route_syscall`] from the SIGSYS handler.
+use artitux::reflex::{Host, KuserRecipe, State};
 use core::ffi::{CStr, c_char, c_int};
 use core::ptr;
 use libc::ucontext_t;
-use linuwux::reflex::{Host, KuserRecipe, State};
 
 static REFLEX_STATE: State = State::new();
 struct RuntimeHost;
@@ -16,6 +16,7 @@ struct RuntimeHost;
 unsafe extern "C" {
     fn cpuid_activate_legacy_profile();
     fn cpuid_kuser_recipe() -> c_int;
+    #[cfg(feature = "faketime")]
     fn set_offset(filetime: u64);
     fn patch_kuser_shared_data_recipe(recipe: c_int) -> c_int;
     fn debug_log(message: *const c_char);
@@ -23,8 +24,16 @@ unsafe extern "C" {
 }
 
 impl Host for RuntimeHost {
-    fn set_offset(&self, filetime: u64) {
-        unsafe { set_offset(filetime) };
+    fn set_offset(&self, _filetime: u64) -> bool {
+        #[cfg(feature = "faketime")]
+        {
+            unsafe { set_offset(_filetime) };
+            true
+        }
+        #[cfg(not(feature = "faketime"))]
+        {
+            false
+        }
     }
     fn select_legacy_presentation(&self) {
         unsafe { cpuid_activate_legacy_profile() };
@@ -40,10 +49,6 @@ impl Host for RuntimeHost {
     }
     fn patch_kuser(&self, recipe: KuserRecipe) -> bool {
         unsafe { patch_kuser_shared_data_recipe(recipe as c_int) == 0 }
-    }
-    fn set_hwprofile_guid(&self) {
-        #[cfg(feature = "environment")]
-        crate::registry::set_hwprofile_guid();
     }
     fn yield_thread(&self) {
         unsafe { libc::sched_yield() };

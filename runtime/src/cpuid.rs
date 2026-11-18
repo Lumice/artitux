@@ -2,9 +2,9 @@
 //! everything it needs: per-caller image detection (`reflex64.dll` selects
 //! the legacy presentation; `artifact.dll` selects host-specific CPU identity
 //! replies),
-//! native-CPUID pass-through and caching for leaves LinUwUx doesn't own, and
+//! native-CPUID pass-through and caching for leaves Artitux doesn't own, and
 //! the `.init_array` constructor that detects the host vendor at startup.
-//! Reply *content* for a given [`linuwux::cpuid::CpuIdentity`] lives in the
+//! Reply *content* for a given [`artitux::cpuid::CpuIdentity`] lives in the
 //! safe core (`protocol/cpuid.rs`); this file owns the trap itself and the
 //! process-local decisions about which identity applies to which caller.
 use core::arch::x86_64::__cpuid_count;
@@ -14,12 +14,12 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 
 use crate::maps;
 use crate::procmem::read_memory;
-use libc::{greg_t, siginfo_t, ucontext_t};
-use linuwux::cpuid::{
+use artitux::cpuid::{
     ActiveCpuIdentity, CpuPresentation, Registers, Vendor, artifact_amd_reply,
     artifact_intel_reply, is_wine_system_rip, proton_avx_enabled,
 };
-use linuwux::kuser::Recipe;
+use artitux::kuser::Recipe;
+use libc::{greg_t, siginfo_t, ucontext_t};
 
 const ARCH_SET_CPUID: c_int = 0x1012;
 const REFLEX_CPUID_CONSUMED: c_int = 1;
@@ -41,9 +41,10 @@ static ARTIFACT_PROFILE_SELECTED: AtomicBool = AtomicBool::new(false);
 static PROTOCOL_ESTABLISHED: AtomicBool = AtomicBool::new(false);
 #[cfg(all(
     feature = "debug",
-    feature = "environment",
-    feature = "hooks",
-    feature = "kuser"
+    any(
+        feature = "artifact",
+        all(feature = "environment", feature = "hooks", feature = "kuser")
+    )
 ))]
 static FORWARDED_GAME_FAULTS_LOGGED: AtomicU64 = AtomicU64::new(0);
 
@@ -139,9 +140,10 @@ unsafe extern "C" {
     fn debug_log(message: *const c_char);
     #[cfg(all(
         feature = "debug",
-        feature = "environment",
-        feature = "hooks",
-        feature = "kuser"
+        any(
+            feature = "artifact",
+            all(feature = "environment", feature = "hooks", feature = "kuser")
+        )
     ))]
     fn debug_log_hex(prefix: *const c_char, value: u64);
     fn forward_signal(sig: c_int, info: *mut siginfo_t, context: *mut c_void);
@@ -390,12 +392,13 @@ impl NativeCache {
 
     fn insert(&self, leaf: u32, subleaf: u32, regs: Registers) {
         let key = u64::from(leaf) << 32 | u64::from(subleaf);
-        while self
+        // Skip caching rather than spinning if contended inside a signal or nested handler.
+        if self
             .lock
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            return;
         }
         let len = self.len.load(Ordering::Relaxed) as usize;
         if len < NATIVE_CACHE_CAP {
@@ -411,6 +414,12 @@ impl NativeCache {
 }
 
 static NATIVE_CACHE: NativeCache = NativeCache::new();
+
+#[cfg_attr(not(feature = "hooks"), allow(dead_code))]
+pub(crate) fn after_fork() {
+    CALLER_CACHE.lock.store(false, Ordering::Release);
+    NATIVE_CACHE.lock.store(false, Ordering::Release);
+}
 
 fn artifact_reply(vendor: Vendor, leaf: u32) -> Option<Registers> {
     match vendor {
@@ -557,14 +566,22 @@ fn is_cpuid_instruction_at(address: usize) -> bool {
 
 #[cfg(all(
     feature = "debug",
-    feature = "environment",
-    feature = "hooks",
-    feature = "kuser"
+    any(
+        feature = "artifact",
+        all(feature = "environment", feature = "hooks", feature = "kuser")
+    )
 ))]
 fn trace_forwarded_game_fault(info: *const siginfo_t, gregs: *const greg_t) {
-    if !crate::environment::game_process()
-        || FORWARDED_GAME_FAULTS_LOGGED.fetch_add(1, Ordering::Relaxed) >= 8
+    let mut game_process = false;
+    #[cfg(all(feature = "environment", feature = "hooks", feature = "kuser"))]
     {
+        game_process |= crate::environment::game_process();
+    }
+    #[cfg(feature = "artifact")]
+    {
+        game_process |= crate::artifact::active();
+    }
+    if !game_process || FORWARDED_GAME_FAULTS_LOGGED.fetch_add(1, Ordering::Relaxed) >= 8 {
         return;
     }
     // SAFETY: the caller has checked both signal-frame pointers non-null.
@@ -598,11 +615,7 @@ fn leaf_varies_per_core(leaf: u32) -> bool {
     leaf == 0xb || leaf == 0x1f
 }
 
-fn native_reply(leaf: u32, subleaf: u32) -> Registers {
-    let cacheable = !leaf_varies_per_core(leaf);
-    if cacheable && let Some(cached) = NATIVE_CACHE.lookup(leaf, subleaf) {
-        return cached;
-    }
+fn native_reply_uncached(leaf: u32, subleaf: u32) -> Option<Registers> {
     if unsafe {
         libc::syscall(
             libc::SYS_arch_prctl,
@@ -611,8 +624,7 @@ fn native_reply(leaf: u32, subleaf: u32) -> Registers {
         )
     } == -1
     {
-        unsafe { debug_log(c"CPUID native pass-through enable failed; returning zeros".as_ptr()) };
-        return Registers::default();
+        return None;
     }
 
     let result = native_cpuid(leaf, subleaf);
@@ -630,10 +642,119 @@ fn native_reply(leaf: u32, subleaf: u32) -> Registers {
             libc::_exit(127);
         }
     }
+    Some(result)
+}
+
+fn native_reply(leaf: u32, subleaf: u32) -> Registers {
+    let cacheable = !leaf_varies_per_core(leaf);
+    if cacheable && let Some(cached) = NATIVE_CACHE.lookup(leaf, subleaf) {
+        return cached;
+    }
+    let Some(result) = native_reply_uncached(leaf, subleaf) else {
+        unsafe { debug_log(c"CPUID native pass-through enable failed; returning zeros".as_ptr()) };
+        return Registers::default();
+    };
     if cacheable {
         NATIVE_CACHE.insert(leaf, subleaf, result);
     }
     result
+}
+
+#[cfg(feature = "artifact")]
+fn artifact_native_reply(leaf: u32, subleaf: u32) -> Registers {
+    let Some(reply) = native_reply_uncached(leaf, subleaf) else {
+        unsafe {
+            debug_log(c"ART native CPUID access failed; terminating".as_ptr());
+            libc::_exit(170);
+        }
+    };
+    reply
+}
+
+enum CpuidOutput {
+    Full(Registers),
+    #[cfg(feature = "artifact")]
+    ArtifactQuery([u64; 4]),
+    #[cfg(feature = "artifact")]
+    ArtifactReady,
+}
+
+#[cfg(feature = "artifact")]
+fn artifact_wine_system_rip(address: u64) -> bool {
+    let mut native = artitux::artifact_profile::native_wine_view(address, None);
+    let mut image_view = None;
+    maps::find_line(|line| {
+        let Some(mapping) = maps::parse(line) else {
+            return false;
+        };
+        if mapping.start > address {
+            return true;
+        }
+        let path = mapping
+            .path
+            .strip_suffix(b" (deleted)")
+            .unwrap_or(mapping.path);
+        let extension = path.get(path.len().saturating_sub(4)..).unwrap_or_default();
+        if mapping.start & 0xffff == 0
+            && mapping.inode != b"0"
+            && (extension.eq_ignore_ascii_case(b".exe") || extension.eq_ignore_ascii_case(b".dll"))
+        {
+            let mut dos = [0u8; 64];
+            if read_memory(mapping.start, &mut dos) && &dos[..2] == b"MZ" {
+                let offset = u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]);
+                if (64..=0x1000).contains(&offset)
+                    && let Some(header) = mapping.start.checked_add(u64::from(offset))
+                {
+                    let mut pe = [0u8; 84];
+                    if read_memory(header, &mut pe)
+                        && artitux::artifact_profile::pe_image_contains(
+                            mapping.start,
+                            address,
+                            &dos,
+                            &pe,
+                        )
+                    {
+                        // Maps are ordered; the closest containing PE header wins.
+                        image_view = Some(artitux::artifact_profile::native_wine_view(
+                            address,
+                            Some(path),
+                        ));
+                    }
+                }
+            }
+        }
+        if !(mapping.start..mapping.end).contains(&address) {
+            return false;
+        }
+        native = if mapping.inode == b"0" {
+            image_view.unwrap_or(native)
+        } else {
+            artitux::artifact_profile::native_wine_view(address, Some(mapping.path))
+        };
+        true
+    });
+    native
+}
+
+fn apply_cpuid_output(registers: &mut [greg_t; 23], output: CpuidOutput) {
+    match output {
+        CpuidOutput::Full(reply) => {
+            registers[libc::REG_RAX as usize] = i64::from(reply.eax);
+            registers[libc::REG_RBX as usize] = i64::from(reply.ebx);
+            registers[libc::REG_RCX as usize] = i64::from(reply.ecx);
+            registers[libc::REG_RDX as usize] = i64::from(reply.edx);
+        }
+        #[cfg(feature = "artifact")]
+        CpuidOutput::ArtifactQuery(reply) => {
+            registers[libc::REG_RAX as usize] = reply[0] as greg_t;
+            registers[libc::REG_RBX as usize] = reply[1] as greg_t;
+            registers[libc::REG_RCX as usize] = reply[2] as greg_t;
+            registers[libc::REG_RDX as usize] = reply[3] as greg_t;
+        }
+        #[cfg(feature = "artifact")]
+        CpuidOutput::ArtifactReady => registers[libc::REG_RAX as usize] = 1,
+    }
+    registers[libc::REG_RIP as usize] = registers[libc::REG_RIP as usize].wrapping_add(2);
 }
 
 #[unsafe(no_mangle)]
@@ -648,6 +769,8 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
         unsafe { forward_signal(sig, info, context) };
         return;
     }
+    #[cfg(feature = "artifact")]
+    let mut dispatch_guard = unsafe { crate::artifact::wine_dispatch_guard() };
 
     let gregs = unsafe { ptr::addr_of_mut!((*context_ptr).uc_mcontext.gregs).cast::<greg_t>() };
     // `int 2e` is identifiable from its faulting opcode and #GP trap number.
@@ -663,9 +786,10 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
     if !is_cpuid_fault {
         #[cfg(all(
             feature = "debug",
-            feature = "environment",
-            feature = "hooks",
-            feature = "kuser"
+            any(
+                feature = "artifact",
+                all(feature = "environment", feature = "hooks", feature = "kuser")
+            )
         ))]
         trace_forwarded_game_fault(info, gregs);
         #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
@@ -681,6 +805,8 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
             let tid = unsafe { libc::gettid() as u64 };
             crate::syscall::trace_null_fault(address, fault_rip, tid);
         }
+        #[cfg(feature = "artifact")]
+        drop(dispatch_guard);
         unsafe { forward_signal(sig, info, context) };
         return;
     }
@@ -689,11 +815,14 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
     if !is_cpuid_instruction_at(rip as usize) {
         #[cfg(all(
             feature = "debug",
-            feature = "environment",
-            feature = "hooks",
-            feature = "kuser"
+            any(
+                feature = "artifact",
+                all(feature = "environment", feature = "hooks", feature = "kuser")
+            )
         ))]
         trace_forwarded_game_fault(info, gregs);
+        #[cfg(feature = "artifact")]
+        drop(dispatch_guard);
         unsafe { forward_signal(sig, info, context) };
         return;
     }
@@ -705,6 +834,52 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
             gregs.add(libc::REG_RDX as usize).read() as u64,
         )
     };
+    #[cfg(feature = "artifact")]
+    {
+        if !crate::artifact::detected() && classify_caller(rip as u64) == Some(CallerKind::Artifact)
+        {
+            crate::artifact::mark_detected();
+            dispatch_guard = unsafe { crate::artifact::wine_dispatch_guard() };
+        }
+        if crate::artifact::detected() {
+            let had_callback = leaf == 0x336933 && crate::artifact::syscall_target().is_some();
+            let action =
+                crate::artifact::cpuid(leaf, control, payload, ACTIVE_IDENTITY.load().vendor());
+            if leaf == 0x336933
+                && !had_callback
+                && let Some(callback) = crate::artifact::syscall_target()
+            {
+                crate::syscall::register_reflex_dispatch_handler(callback);
+                PROTOCOL_ESTABLISHED.store(true, Ordering::Release);
+            }
+            let output = match action {
+                artitux::artifact::CpuidAction::Ready => CpuidOutput::ArtifactReady,
+                artitux::artifact::CpuidAction::Zero => CpuidOutput::Full(Registers::default()),
+                artitux::artifact::CpuidAction::Query if !artifact_wine_system_rip(rip as u64) => {
+                    CpuidOutput::ArtifactQuery(artitux::artifact_profile::reply(
+                        ACTIVE_IDENTITY.load().vendor(),
+                        leaf,
+                        control as u32,
+                        || artifact_native_reply(leaf, control as u32),
+                    ))
+                }
+                artitux::artifact::CpuidAction::Native
+                    if dispatch_guard.is_some() && !artifact_wine_system_rip(rip as u64) =>
+                {
+                    CpuidOutput::ArtifactQuery(artitux::artifact_cpu::native_words(
+                        ACTIVE_IDENTITY.load().vendor(),
+                        artifact_native_reply(leaf, control as u32),
+                    ))
+                }
+                artitux::artifact::CpuidAction::Query | artitux::artifact::CpuidAction::Native => {
+                    CpuidOutput::Full(artifact_native_reply(leaf, control as u32))
+                }
+            };
+            apply_cpuid_output(unsafe { &mut (*context_ptr).uc_mcontext.gregs }, output);
+            drop(dispatch_guard);
+            return;
+        }
+    }
     #[cfg(all(feature = "syscall", feature = "kuser", feature = "reflex"))]
     if leaf == 0x0033_6933 {
         crate::syscall::register_reflex_dispatch_handler(control);
@@ -725,21 +900,10 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
         }
     };
 
-    unsafe {
-        gregs
-            .add(libc::REG_RAX as usize)
-            .write(i64::from(reply.eax));
-        gregs
-            .add(libc::REG_RBX as usize)
-            .write(i64::from(reply.ebx));
-        gregs
-            .add(libc::REG_RCX as usize)
-            .write(i64::from(reply.ecx));
-        gregs
-            .add(libc::REG_RDX as usize)
-            .write(i64::from(reply.edx));
-        gregs.add(libc::REG_RIP as usize).write(rip.wrapping_add(2));
-    }
+    apply_cpuid_output(
+        unsafe { &mut (*context_ptr).uc_mcontext.gregs },
+        CpuidOutput::Full(reply),
+    );
 }
 
 #[cfg(test)]
@@ -855,7 +1019,7 @@ mod protocol_established_tests {
 #[cfg(test)]
 mod artifact_profile_tests {
     use super::{artifact_reply, with_native_apic_id};
-    use linuwux::cpuid::{CpuIdentity, Registers, Vendor};
+    use artitux::cpuid::{CpuIdentity, Registers, Vendor};
 
     #[test]
     fn selects_artifact_reply_by_host_vendor() {
@@ -954,7 +1118,7 @@ mod int2e_signal_tests {
 // under two workloads, to check a hypothesis about a reported fps regression
 // (Monster Hunter Wilds, 160->90fps) rather than reason about it further from
 // first principles. `#[ignore]` since it's a manual diagnostic, not part of
-// the normal suite; run with `cargo test -p linuwux-runtime --lib
+// the normal suite; run with `cargo test -p artitux-runtime --lib
 // classify_caller_bench -- --ignored --nocapture`.
 #[cfg(all(test, not(miri)))]
 mod classify_caller_bench {
@@ -1046,7 +1210,7 @@ mod classify_caller_bench {
     // this process has accumulated more of its own mappings over a session
     // (asset streaming, DLL loads, etc.) — every miss re-scans the *entire*
     // current `/proc/self/maps`, unconditionally, forever; there's no cap and
-    // no negative-cache. Run with `cargo test -p linuwux-runtime --lib
+    // no negative-cache. Run with `cargo test -p artitux-runtime --lib
     // classify_caller_cost_scales_with_map_size -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -1121,5 +1285,151 @@ mod classify_caller_bench {
         for page in scan_only.into_iter().chain(pe_probe).chain(padding) {
             unsafe { libc::munmap(page, 0x1000) };
         }
+    }
+}
+
+#[cfg(all(test, feature = "artifact"))]
+mod artifact_cpuid_output_tests {
+    use super::{CpuidOutput, apply_cpuid_output};
+
+    #[test]
+    fn artifact_ready_preserves_every_incoming_register_except_rax_and_next_rip() {
+        let mut registers =
+            core::array::from_fn(|index| (0x1234_0000_0000_0000u64 | index as u64) as libc::greg_t);
+        registers[libc::REG_RIP as usize] = 0x140001000;
+        let before = registers;
+        apply_cpuid_output(&mut registers, CpuidOutput::ArtifactReady);
+        assert_eq!(registers[libc::REG_RAX as usize], 1);
+        assert_eq!(registers[libc::REG_RIP as usize], 0x140001002);
+        for index in 0..registers.len() {
+            if index != libc::REG_RAX as usize && index != libc::REG_RIP as usize {
+                assert_eq!(registers[index], before[index], "register {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_query_keeps_signed_source_words_without_clobbering_other_state() {
+        let mut registers =
+            core::array::from_fn(|index| (0x1234_0000_0000_0000u64 | index as u64) as libc::greg_t);
+        registers[libc::REG_RIP as usize] = 0x140001000;
+        let before = registers;
+        let reply = [0, 0x0180_0020, 0xffff_ffff_8040_0200, 0xffff_ffff_8000_4000];
+        apply_cpuid_output(&mut registers, CpuidOutput::ArtifactQuery(reply));
+        for (index, value) in [
+            (libc::REG_RAX, reply[0]),
+            (libc::REG_RBX, reply[1]),
+            (libc::REG_RCX, reply[2]),
+            (libc::REG_RDX, reply[3]),
+        ] {
+            assert_eq!(registers[index as usize] as u64, value);
+        }
+        assert_eq!(registers[libc::REG_RIP as usize], 0x140001002);
+        for index in 0..registers.len() {
+            if ![
+                libc::REG_RAX,
+                libc::REG_RBX,
+                libc::REG_RCX,
+                libc::REG_RDX,
+                libc::REG_RIP,
+            ]
+            .contains(&(index as i32))
+            {
+                assert_eq!(registers[index], before[index], "register {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_gs_zero_thread_keeps_architectural_cpuid_words_after_art_detection() {
+        const ARCH_GET_CPUID: libc::c_long = 0x1011;
+        let previous_cpuid_mode =
+            unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0 as libc::c_ulong) };
+        let cpuid_faulting_supported = previous_cpuid_mode >= 0
+            && unsafe {
+                libc::syscall(
+                    libc::SYS_arch_prctl,
+                    super::ARCH_SET_CPUID as libc::c_long,
+                    previous_cpuid_mode as libc::c_ulong,
+                )
+            } != -1;
+        if !cpuid_faulting_supported {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENODEV)
+            );
+        }
+        let child = unsafe { libc::syscall(libc::SYS_fork) };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe {
+                crate::artifact::mark_detected();
+                if crate::artifact::wine_dispatch_guard().is_some() {
+                    libc::_exit(70);
+                }
+                let native = if cpuid_faulting_supported {
+                    let Some(native) = super::native_reply_uncached(0x8000_0000, 0) else {
+                        libc::_exit(71);
+                    };
+                    Some(native)
+                } else {
+                    if super::native_reply_uncached(0x8000_0000, 0).is_some() {
+                        libc::_exit(73);
+                    }
+                    None
+                };
+                super::cpuid_configure_profile(1, 1);
+                static OPCODE: [u8; 2] = [0x0f, 0xa2];
+                let mut context: libc::ucontext_t = core::mem::zeroed();
+                let mut info: libc::siginfo_t = core::mem::zeroed();
+                info.si_code = libc::SI_KERNEL;
+                context.uc_mcontext.gregs[libc::REG_RAX as usize] = 0x8000_0000;
+                context.uc_mcontext.gregs[libc::REG_RIP as usize] = OPCODE.as_ptr() as libc::greg_t;
+                context.uc_mcontext.gregs[libc::REG_TRAPNO as usize] = 13;
+                super::cpuid_sigsegv_handler(
+                    libc::SIGSEGV,
+                    &mut info,
+                    (&mut context as *mut libc::ucontext_t).cast(),
+                );
+                let Some(native) = native else {
+                    // `artifact_native_reply` must terminate with 170 before reaching here.
+                    libc::_exit(74);
+                };
+                let expected = [native.eax, native.ebx, native.ecx, native.edx];
+                let indices = [libc::REG_RAX, libc::REG_RBX, libc::REG_RCX, libc::REG_RDX];
+                let unchanged = indices.into_iter().zip(expected).all(|(index, word)| {
+                    context.uc_mcontext.gregs[index as usize] as u64 == u64::from(word)
+                });
+                libc::_exit(if unchanged { 0 } else { 72 });
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut status = 0;
+        loop {
+            let result = unsafe { libc::waitpid(child as libc::pid_t, &mut status, libc::WNOHANG) };
+            if result == child as libc::pid_t {
+                break;
+            }
+            if result < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EINTR)
+                );
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(child as libc::pid_t, libc::SIGKILL);
+                    libc::waitpid(child as libc::pid_t, &mut status, 0);
+                }
+                panic!("native CPUID child timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(libc::WIFEXITED(status), "child status {status}");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            if cpuid_faulting_supported { 0 } else { 170 }
+        );
     }
 }

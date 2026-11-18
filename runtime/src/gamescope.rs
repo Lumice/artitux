@@ -1,18 +1,18 @@
 //! Detects a Gamescope session (own process, desktop env vars, or process
 //! ancestry — see `protocol/gamescope.rs` for the pure detection logic) and,
 //! if found, interposes `setenv`/`unsetenv` so that when Gamescope
-//! re-executes itself or rewrites its child's environment, LinUwUx's own
+//! re-executes itself or rewrites its child's environment, Artitux's own
 //! `LD_PRELOAD` entry is preserved rather than silently dropped from the
 //! process Gamescope actually launches.
+use artitux::gamescope::{
+    ANCESTRY_LIMIT, is_gamescope_path, is_gamescope_session as session_has_gamescope,
+    preload_has_path, preserved_length,
+};
 use core::cell::UnsafeCell;
 use core::ffi::{CStr, c_char, c_int, c_void};
 use core::mem::MaybeUninit;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use linuwux::gamescope::{
-    ANCESTRY_LIMIT, is_gamescope_path, is_gamescope_session as session_has_gamescope,
-    preload_has_path, preserved_length,
-};
 
 const PATH_MAX: usize = libc::PATH_MAX as usize;
 type Setenv = unsafe extern "C" fn(*const c_char, *const c_char, c_int) -> c_int;
@@ -105,7 +105,7 @@ fn parent_process_id(pid: libc::pid_t) -> libc::pid_t {
     unsafe {
         while !libc::fgets(line.as_mut_ptr(), line.len() as c_int, file).is_null() {
             if let Some(value) =
-                linuwux::gamescope::parent_process_id(CStr::from_ptr(line.as_ptr()).to_bytes())
+                artitux::gamescope::parent_process_id(CStr::from_ptr(line.as_ptr()).to_bytes())
             {
                 parent = value;
                 break;
@@ -203,7 +203,7 @@ unsafe fn resolve_self_path() -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn linuwux_setup_gamescope() {
+pub unsafe extern "C" fn artitux_setup_gamescope() {
     if !gamescope_detected() || resolve_real_setenv().is_none() || resolve_real_unsetenv().is_none()
     {
         return;
@@ -290,4 +290,4 @@ unsafe fn fill_preserved(destination: *mut c_char, value: &CStr, path: &CStr) {
 
 #[used]
 #[unsafe(link_section = ".init_array.00103")]
-static INITIALIZE: unsafe extern "C" fn() = linuwux_setup_gamescope;
+static INITIALIZE: unsafe extern "C" fn() = artitux_setup_gamescope;

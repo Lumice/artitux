@@ -1,6 +1,6 @@
 # Syscall routing: goal and invariants
 
-This is the permanent design spec for how LinUwUx routes a game's Windows
+This is the permanent design spec for how Artitux routes a game's Windows
 syscalls on Linux. It states the target behavior; see
 [`topspin-investigation.md`](topspin-investigation.md) for the one open
 compatibility issue currently blocking full compliance with it, and
@@ -11,7 +11,7 @@ this design has to accommodate.
 
 Run Reflex's intended syscall checks and routing on Linux **without
 modifying `KUSER_SHARED_DATA.SystemCall`**. Calls that Reflex handles
-specially must reach the corresponding LinUwUx/Reflex handler. Calls that
+specially must reach the corresponding Artitux/Reflex handler. Calls that
 Reflex bypasses must reach Wine's existing syscall handler with the same
 request, return behavior, and caller-visible machine state as Wine's direct
 ntdll syscall path.
@@ -28,21 +28,21 @@ flowchart LR
     A[ntdll syscall stub] --> B{KUSER SystemCall}
     B -->|zero: legacy hack, being removed| C[raw syscall]
     B -->|normal: target behavior| D[Wine KUSER dispatcher slot]
-    D --> E[LinUwUx dispatcher bridge]
+    D --> E[Artitux dispatcher bridge]
     E -->|ordinary call| F[original Wine dispatcher]
     E -->|IAT-marked stub or external caller| C
     C --> G[Linux SIGSYS]
     F --> G
-    G --> H{LinUwUx route decision}
+    G --> H{Artitux route decision}
     H -->|registered Reflex selector/service| I[Reflex handler]
     H -->|ordinary or bypass| J[Wine SIGSYS handler]
     I --> K[resume caller]
     J --> K
 ```
 
-The legacy `LINUWUX_SYSCALL_HACK` path only changes the first decision: it
+The legacy `ARTITUX_SYSCALL_HACK` path only changes the first decision: it
 makes Wine's ntdll stub take its direct `syscall` branch, skipping the KUSER
-dispatcher call and LinUwUx's KUSER dispatcher bridge. Linux SIGSYS
+dispatcher call and Artitux's KUSER dispatcher bridge. Linux SIGSYS
 interposition remains active either way. In the normal KUSER mode, the
 bridge selects a raw syscall replay for an IAT-marked stub, or for an
 unmarked stub whose caller is outside Wine's image range. SIGSYS then makes
@@ -52,7 +52,7 @@ Wine.
 ## Required behavior and invariants
 
 1. **Preserve Wine's normal semantics by default.** Unknown or unregistered
-   syscalls must use Wine's original dispatcher/handler. LinUwUx must not
+   syscalls must use Wine's original dispatcher/handler. Artitux must not
    reimplement file, virtual-memory, or handle services merely to imitate
    forwarding.
 2. **Make Reflex decisions from runtime data.** Use registered syscall IDs,
@@ -85,7 +85,7 @@ Three independent decisions, each owned by its own module (see
 
 | Boundary | Job | Evidence used |
 | --- | --- | --- |
-| KUSER shared data | Install the LinUwUx dispatcher bridge in the KUSER dispatcher slot. | None — this is unconditional once Reflex is detected, with no per-call decision. |
+| KUSER shared data | Install the Artitux dispatcher bridge in the KUSER dispatcher slot. | None — this is unconditional once Reflex is detected, with no per-call decision. |
 | KUSER dispatcher bridge | Keep ordinary Wine calls on Wine's dispatcher; replay IAT-marked stubs and unmarked raw stubs from outside Wine's image range. | Captured Reflex IAT stub addresses, caller table, copied stub service number/opcode, caller image ranges. |
 | SIGSYS interposer | Forward ordinary Wine syscalls to Wine; for bridged calls, try registered Reflex routing and either jump to its target or forward. | Bridge marker keyed by raw syscall RSP/RIP, XMM5 bypass magic, RAX service, R10/RCX constraints, registration state and targets. |
 
@@ -95,10 +95,10 @@ Some Wine builds can return success from `NtUserBuildHwndList` when the caller
 passes a zero-capacity, null output buffer and the server reports no windows.
 The implementation then writes the mandatory `HWND_BOTTOM` terminator through
 that null pointer. NBA 2K25 reaches this path through a Reflex bypass; the
-captured request has the null buffer before LinUwUx emulates `int 2e`, and the
+captured request has the null buffer before Artitux emulates `int 2e`, and the
 arguments remain unchanged at SIGSYS.
 
-For this one request, after Reflex has chosen bypass, LinUwUx writes a minimum
+For this one request, after Reflex has chosen bypass, Artitux writes a minimum
 required size of one and returns `STATUS_BUFFER_TOO_SMALL`. The caller can
 allocate and retry; Wine still handles the retry and every other request.
 The service ID is resolved from the loaded Wine `win32u.dll` export rather
@@ -124,7 +124,7 @@ Wine fault and the later game exception.
 ## Out of scope
 
 - Treating any one game's disassembled addresses as permanent route keys.
-- Reproducing arbitrary Wine syscalls inside LinUwUx.
+- Reproducing arbitrary Wine syscalls inside Artitux.
 - Assuming that matching syscall status/output proves identical continuation
   state.
 - Adding uncoordinated environment variables or unbounded SIGSYS logs.

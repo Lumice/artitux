@@ -6,9 +6,10 @@
 //! recipe waits or is rejected instead of corrupting a page mid-write. This
 //! file only describes *what* to write and *whether* a given recipe may
 //! apply now; `runtime/src/kuser.rs` owns the actual page, its
-//! `mprotect`/`PageGuard` locking, and the `LINUWUX_SYSCALL_HACK` control
+//! `mprotect`/`PageGuard` locking, and the `ARTITUX_SYSCALL_HACK` control
 //! that writes into the recipe's applied page afterward (see
 //! `docs/protocol/topspin-investigation.md` for why that flag still exists).
+use crate::cpuid::Vendor;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 pub const PAGE_SIZE: usize = 4096;
@@ -36,21 +37,12 @@ impl Recipe {
             Self::Dispatch => DISPATCH_OPS,
             Self::Selector => SELECTOR_OPS,
             Self::Resume => {
-                for (index, byte) in b"C:\\Windows\0".iter().copied().enumerate() {
-                    write(0x30 + index * 2, byte);
-                    write(0x31 + index * 2, 0);
-                }
-                for offset in 0x46..0x134 {
-                    write(offset, 0);
-                }
-                RESUME_OPS
+                visit_system_root(&mut write);
+                visit_ops(IDENTITY_OPS, &mut write);
+                RESUME_EXTRA_OPS
             }
         };
-        for &(offset, size, value) in ops {
-            for (index, byte) in value.to_le_bytes()[..size].iter().copied().enumerate() {
-                write(offset + index, byte);
-            }
-        }
+        visit_ops(ops, &mut write);
         if self == Self::Resume {
             for offset in [0x290, 0x294, 0x295, 0x297] {
                 write(offset, 0);
@@ -67,7 +59,39 @@ impl Recipe {
     }
 }
 
-const RESUME_OPS: &[(usize, usize, u64)] = &[
+fn visit_system_root(write: &mut impl FnMut(usize, u8)) {
+    for (index, byte) in b"C:\\Windows\0".iter().copied().enumerate() {
+        write(0x30 + index * 2, byte);
+        write(0x31 + index * 2, 0);
+    }
+    for offset in 0x46..0x134 {
+        write(offset, 0);
+    }
+}
+
+fn visit_ops(ops: &[(usize, usize, u64)], write: &mut impl FnMut(usize, u8)) {
+    for &(offset, size, value) in ops {
+        for (index, byte) in value.to_le_bytes()[..size].iter().copied().enumerate() {
+            write(offset + index, byte);
+        }
+    }
+}
+
+/// Source ART identity metadata, without legacy Reflex XSTATE/marker writes.
+/// QpcData stays native: Wine, not the source Windows kernel, owns its clock.
+pub fn visit_artifact_writes(vendor: Vendor, mut write: impl FnMut(usize, u8)) -> bool {
+    if vendor == Vendor::Unknown {
+        return false;
+    }
+    visit_system_root(&mut write);
+    visit_ops(IDENTITY_OPS, &mut write);
+    if vendor == Vendor::Intel {
+        write(0x297, 0);
+    }
+    true
+}
+
+const IDENTITY_OPS: &[(usize, usize, u64)] = &[
     (0x260, 8, 0x0000000100006658),
     (0x268, 4, 0x00090001),
     (0x26c, 4, 0x0000000a),
@@ -88,6 +112,16 @@ const RESUME_OPS: &[(usize, usize, u64)] = &[
     (0x2a8, 4, 0),
     (0x2ac, 4, 0),
     (0x2b0, 4, 1),
+    (0x2d0, 8, 0x00320A0000000110),
+    (0x2e8, 8, 0x00000100007FB10B),
+    (0x2f4, 4, 0),
+    (0x36c, 8, 0),
+    (0x374, 8, 0),
+    (0x37c, 4, 1),
+    (0x3c0, 6, 0x0000000100000010),
+];
+
+const RESUME_EXTRA_OPS: &[(usize, usize, u64)] = &[
     (0x3d8, 8, 0),
     (0x3e0, 8, 0),
     (0x3ec, 4, 0),
@@ -95,13 +129,7 @@ const RESUME_OPS: &[(usize, usize, u64)] = &[
     (0x5f8, 8, 0),
     (0x808, 8, 0),
     (0x810, 8, 0),
-    (0x2d0, 8, 0x00320A0000000110),
-    (0x2e8, 8, 0x00000100007FB10B),
-    (0x2f4, 4, 0),
-    (0x36c, 8, 0),
-    (0x374, 8, 0),
-    (0x37c, 4, 1),
-    (0x3c0, 8, 0x0083000100000010),
+    (0x3c6, 2, 0x83),
     (0xffc, 4, 0x13371337),
 ];
 
@@ -273,6 +301,48 @@ impl PatchState {
             Ok(())
         } else {
             Err(PatchError::ApplyFailed)
+        }
+    }
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    use crate::cpuid::{Registers, Vendor};
+
+    #[test]
+    fn artifact_shared_cpu_count_agrees_with_the_registered_cpuid_view() {
+        for vendor in [Vendor::Amd, Vendor::Intel] {
+            let mut page = [0xa5u8; super::PAGE_SIZE];
+            page[0x3c0..0x3c4].copy_from_slice(&12u32.to_le_bytes());
+            assert!(super::visit_artifact_writes(vendor, |offset, byte| page
+                [offset] =
+                byte));
+            let cpuid = crate::artifact_cpu::reply(vendor, 1, 0, || Registers::new(0, 0, 0, 0));
+            let count = u32::from_le_bytes(page[0x3c0..0x3c4].try_into().unwrap());
+            assert_eq!(u64::from(count), (cpuid[1] >> 16) & 0xff);
+            assert_eq!(page[0x297], u8::from(vendor == Vendor::Amd));
+        }
+    }
+
+    #[test]
+    fn artifact_identity_does_not_replace_native_clock_controls_or_xstate() {
+        for vendor in [Vendor::Amd, Vendor::Intel] {
+            let mut page = [0xa5u8; super::PAGE_SIZE];
+            page[0x3c6..0x3c8].copy_from_slice(&[0x12, 0x34]);
+            let before = page;
+            assert!(super::visit_artifact_writes(vendor, |offset, byte| page
+                [offset] =
+                byte));
+            for range in [
+                0x8..0x20,
+                0x2e4..0x2e8,
+                0x300..0x368,
+                0x3c6..0x3c8,
+                0x3d8..0x820,
+                0xffc..0x1000,
+            ] {
+                assert_eq!(page[range.clone()], before[range]);
+            }
         }
     }
 }

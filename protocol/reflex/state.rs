@@ -155,7 +155,8 @@ pub struct SyscallRoute {
 pub use crate::kuser::Recipe as KuserRecipe;
 
 pub trait Host {
-    fn set_offset(&self, filetime: u64);
+    /// Return false when this build does not support the time-control command.
+    fn set_offset(&self, filetime: u64) -> bool;
     fn select_legacy_presentation(&self);
     fn legacy_presentation_active(&self) -> bool;
     fn selector_kuser_recipe(&self) -> KuserRecipe;
@@ -388,7 +389,9 @@ impl State {
             }
             SET_TIME => {
                 Self::log_control(host, leaf, argument);
-                host.set_offset(argument << 32);
+                if !host.set_offset(argument << 32) {
+                    return Action::Native;
+                }
             }
             REGISTER_TARGET_PID => {
                 if self.routing() == Routing::Unregistered {

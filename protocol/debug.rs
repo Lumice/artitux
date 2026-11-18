@@ -21,7 +21,7 @@ impl Line {
             bytes: [0; CAPACITY],
             length: 0,
         };
-        line.append(b"[linuwux] pid=");
+        line.append(b"[artitux] pid=");
         line.number(pid, false);
         if let Some(tid) = thread_id {
             line.append(b" linux_tid=");

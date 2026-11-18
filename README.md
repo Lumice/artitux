@@ -1,323 +1,286 @@
-# As of the release of SWGR, PBZ, PZ2 Linuwux is no longer compatible with newer titles.
-# For newer releases, please see [Legion-KVM](https://github.com/brcly/legion-kvm)
+# Artitux
 
+Artitux is a Linux compatibility runtime for Windows games that run through
+Wine or Proton. It loads into the game through `LD_PRELOAD`. It keeps these
+parts of the system consistent across the game and its child processes: the CPU
+profile, the Windows shared system data (`KUSER_SHARED_DATA`), the loader
+state, the process heap table, the clocks, the signal handling, and the Wine
+environment. Artitux does not change Proton, the game files, or the Wine
+prefixes.
 
-![LinUwUx terminal banner](.github/assets/linuwux-banner.png)
+Artitux is a fork of [LinUwUx](https://github.com/brcly/linuwux-runtime). It
+keeps the core runtime features of LinUwUx: CPUID trapping, KUSER shared data,
+signal and syscall routing, Gamescope support, and environment handling. It
+adds support for titles that LinUwUx does not cover. If a game already works
+with LinUwUx, use LinUwUx.
 
-# LinUwUx
+## Confirmed titles
 
-LinUwUx is a small Linux compatibility runtime for Windows games running through
-Wine or Proton. It uses `LD_PRELOAD` to keep the CPU profile, Windows shared
-system data, clocks, signal handling, and Wine environment consistent across the
-game and its child processes.
-nmjhh]=[[[[[[
-It does not replace Proton or modify game files and prefixes. The installer adds
-a `linuwux` wrapper which goes in front of the normal launch command.
+- Planet Zoo 2 v1.0.10 (GE-Proton 11-11)
 
-## Why Rust?
-
-The original LinUwUx was written in C. I mostly work with C++, so Rust felt
-familiar while catching more mistakes at compile time. That is useful in code
-which deals with signals, raw pointers, shared state, CPU registers, and libc
-interposition.
-
-Some `unsafe` code is unavoidable, but Rust keeps those boundaries visible. The
-release library still has no garbage collector, uses `no_std`, exports a C ABI,
-and compiles to a small native shared object.
+Artitux works with Artifact releases prepared with VBS 1.9. It does not work
+with releases prepared with VBS 2.0. Before you report a problem, find out which
+VBS version the release uses.
 
 ## Requirements
 
-Valve Proton, Proton Experimental, GE-Proton, and UMU-managed builds should all
-work. The host needs:
+Valve Proton, Proton Experimental, GE-Proton, and UMU-managed builds are
+expected to work. Only GE-Proton 11-11 is confirmed. The host needs:
 
 - x86-64 Linux with glibc 2.34 or newer
-- a 64-bit Wine/Proton host process or modern WoW64 setup
-- working `LD_PRELOAD` support
-- access to the installed library from inside any launcher sandbox
+- A 64-bit Wine or Proton host process, or a modern WoW64 setup
+- Working `LD_PRELOAD` support
+- Access to the installed library from inside any launcher sandbox
 
-Native 32-bit Wine processes cannot load the 64-bit library and may print a
+Native 32-bit Wine processes cannot load the 64-bit library. They can print a
 `wrong ELF class` warning.
 
 ### CPU and kernel prerequisites
 
-LinUwUx needs UMIP disabled and CPUID faulting available. Check both flags first:
+Artitux needs UMIP disabled and CPUID faulting available. UMIP (User-Mode
+Instruction Prevention) is a CPU security feature. CPUID faulting lets Artitux
+answer CPU identification requests from the game. Read both flags first:
 
 ```sh
 grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(umip|cpuid_fault)$'
 ```
 
-- `umip` means UMIP is enabled and needs to be disabled.
-- `cpuid_fault` means native CPUID faulting is available and no emulation module
-  is needed.
+- If the output shows `umip`, UMIP is enabled and you must disable it.
+- If the output shows `cpuid_fault`, the CPU supports CPUID faulting and you do
+  not need an emulation module.
 
-As a rough guide, Intel 9th generation and AMD Ryzen 3000 or newer CPUs normally
-need UMIP disabled. AMD Ryzen AM4 CPUs up to the Ryzen 5000 series, including the
-Steam Deck, normally need the `cpuid_fault_emulation` DKMS module as well. Trust
-the flags over the model name.
+Intel 9th generation CPUs and newer, and AMD Ryzen 3000 CPUs and newer, usually
+need UMIP disabled. AMD Ryzen AM4 CPUs up to the Ryzen 5000 series and the Steam
+Deck usually also need the `cpuid_fault_emulation` DKMS module. The flags are
+more reliable than the model name.
 
 #### Disable UMIP
 
-If `umip` is listed, add this to your kernel command line using your
-distribution's bootloader instructions, then reboot:
+If the output shows `umip`, add this parameter to your kernel command line.
+Follow your distribution's bootloader instructions, then reboot:
 
 ```text
 clearcpuid=514
 ```
 
-Check it afterwards:
+After the reboot, make sure that the change applied:
 
 ```sh
 cat /proc/cmdline
 grep -qw umip /proc/cpuinfo && echo 'UMIP is still enabled' || echo 'UMIP is not enabled'
 ```
 
-This affects the whole system. The kernel documents `clearcpuid` as a debugging
-aid and notes that it taints the kernel. Remove the parameter and reboot to undo
-the change.
+This parameter changes the whole system. The kernel documentation describes
+`clearcpuid` as a debugging aid that taints the kernel. To undo the change,
+remove the parameter and reboot.
+
+Note: `clearcpuid=514` is not tested with Artitux yet. The tested setups
+disabled UMIP with a kernel module instead.
 
 #### CPUID faulting on AMD
 
-If `cpuid_fault` is missing on an AMD AM4 system or Steam Deck, install the
-`cpuid_fault_emulation` DKMS module. It needs matching kernel headers and build
-tools, DKMS, and AMD virtualization enabled in the firmware.
+If `cpuid_fault` is missing on an AMD AM4 system or a Steam Deck, install the
+`cpuid_fault_emulation` DKMS module. The module needs DKMS, build tools, kernel
+headers that match your kernel, and AMD virtualization enabled in the firmware.
 
-The LinUwUx installer does not provide this module. Get it from a source you
-trust. Secure Boot systems must sign it with an enrolled key.
+The Artitux installer does not include this module. Get it from a source that
+you trust.
 
 ## Install
 
+Run the installer:
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/brcly/linuwux-runtime/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | bash
 ```
 
-This installs:
+To install a specific release instead of the latest release, set
+`ARTITUX_VERSION`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | ARTITUX_VERSION=v1.0.0 bash
+```
+
+You can also build Artitux from source. See "Build from source" below. The
+installer writes these files:
 
 ```text
-~/.local/bin/linuwux
-~/.local/share/linuwux/LinUwUx.so
+~/.local/bin/artitux
+~/.local/share/artitux/Artitux.so
 ```
 
-The default install needs no root access. If `~/.local/bin` is missing from
-`PATH`, add this to your shell profile and sign out and back in:
+The default install does not need root access. To also create the symlink
+`/usr/local/bin/artitux`, pass `--global`. The installer then asks for your
+`sudo` password:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | bash -s -- --global
+```
+
+If `~/.local/bin` is not in your `PATH` after a default install, add this line
+to your shell profile. Then sign out and sign in again:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Check the install with `command -v linuwux`. Run the installer again to update.
+Then set the game's launch command to:
 
-If you want bare `linuwux` to work from desktop launchers whose session `PATH`
-does not include `~/.local/bin`, optionally install the launcher globally:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/brcly/linuwux-runtime/main/install.sh | bash -s -- --global
+```text
+/home/USERNAME/.local/bin/artitux %command%
 ```
-
-This asks for a sudo password and installs only the launcher in
-`/usr/local/bin`; the library remains in your home directory.
-
-Some desktop sessions, including UWSM-managed Hyprland sessions, replace the
-user `PATH` after login. An `environment.d` file may be read but still not reach
-Noctalia, Faugus, or other already-managed applications. Use the absolute path
-in launcher settings, or use `--global` if you want the bare command.
 
 ## Steam
 
-Add this under **Properties > Launch Options**:
+Add this line under **Properties > Launch Options**:
 
 ```text
-/home/USERNAME/.local/bin/linuwux %command%
+/home/USERNAME/.local/bin/artitux %command%
 ```
 
-`linuwux` is a command prefix. Put actual variables before it:
+`artitux` is a command prefix. Put any environment variables before it, for
+example `PROTON_LOG=1 /home/USERNAME/.local/bin/artitux %command%`.
 
-```text
-PROTON_AVX=1 /home/USERNAME/.local/bin/linuwux %command%
-```
-
-For Flatpak Steam, use the full path if the command cannot be found:
-
-```text
-/home/USERNAME/.local/bin/linuwux %command%
-```
-
-The Flatpak must also be able to read
-`/home/USERNAME/.local/share/linuwux/LinUwUx.so`.
+For Flatpak Steam, use the full path above. Make sure that the Flatpak can read
+`/home/USERNAME/.local/share/artitux/Artitux.so`.
 
 ## Gamescope and MangoHud
 
-For normal launches, put `linuwux` before the game command:
+For normal launches, put `artitux` before the game command:
 
 ```text
-mangohud /home/USERNAME/.local/bin/linuwux %command%
-MANGOHUD=1 /home/USERNAME/.local/bin/linuwux %command%
+mangohud /home/USERNAME/.local/bin/artitux %command%
+MANGOHUD=1 /home/USERNAME/.local/bin/artitux %command%
 ```
 
-When Gamescope wraps the game, put `linuwux` before Gamescope. This keeps the
-runtime loaded if Gamescope re-executes itself or rewrites the child environment:
+When Gamescope starts the game, put `artitux` before Gamescope. Gamescope can
+start itself again or change the environment that its child processes get.
+In this position, Artitux stays loaded when that happens:
 
 ```text
-/home/USERNAME/.local/bin/linuwux gamescope -f -- %command%
-/home/USERNAME/.local/bin/linuwux gamescope --mangoapp -f -- %command%
-PROTON_AVX=1 /home/USERNAME/.local/bin/linuwux gamescope --mangoapp -f -- %command%
+/home/USERNAME/.local/bin/artitux gamescope -f -- %command%
+/home/USERNAME/.local/bin/artitux gamescope --mangoapp -f -- %command%
 ```
 
-Putting `linuwux` after Gamescope loads it only in the game process.
+If you put `artitux` after Gamescope, Artitux loads only in the game process.
 
-The wrapper also drops any `gameoverlayrenderer.so` entry from an inherited
-`LD_PRELOAD` when the wrapped command is `gamescope`, so Gamescope does not
-re-inject a Steam overlay LinUwUx did not request.
+When the wrapped command is `gamescope`, the wrapper removes any
+`gameoverlayrenderer.so` entry from the inherited `LD_PRELOAD`. This stops
+Gamescope from loading a Steam overlay that Artitux did not request.
 
 ## Other launchers
 
-- **Faugus Launcher:** Edit the game, open **Tools > Launch Settings**, and set
-  **Launch Argument** to `/home/USERNAME/.local/bin/linuwux`. Use **Launch
-  Arguments**, rather than **Game Arguments**. Its built-in GameMode and MangoHud
-  switches can stay enabled.
-  For Gamescope, use `/home/USERNAME/.local/bin/linuwux gamescope --` as the
-  launch argument.
-- **Lutris:** Open **Configure > Advanced options > System options** and set
-  **Command prefix** to `/home/USERNAME/.local/bin/linuwux`.
-- **Heroic, Bottles, and other frontends:** Put `/home/USERNAME/.local/bin/linuwux` in the per-game
-  **Wrapper** or **Command prefix** field.
+- Faugus Launcher: Edit the game and open **Tools > Launch Settings**. Set
+  **Launch Arguments** to `/home/USERNAME/.local/bin/artitux`. Use **Launch
+  Arguments**, not **Game Arguments**. Do not add `%command%`. Faugus does not
+  replace it, so the launch fails. You can keep the built-in GameMode and
+  MangoHud switches on. For Gamescope, set the launch argument to
+  `/home/USERNAME/.local/bin/artitux gamescope --`.
+- Lutris: Open **Configure > Advanced options > System options**. Set **Command
+  prefix** to `/home/USERNAME/.local/bin/artitux`.
+- Heroic, Bottles, and other frontends: Put `/home/USERNAME/.local/bin/artitux`
+  in the game's **Wrapper** or **Command prefix** field.
 
-For Flatpak launchers, use `/home/USERNAME/.local/bin/linuwux` and allow access
-to the installed library. If a launcher only accepts environment variables, set:
+For Flatpak launchers, use `/home/USERNAME/.local/bin/artitux` and give the
+launcher access to the installed library. If a launcher accepts only
+environment variables, set:
 
 | Name | Value |
 | --- | --- |
-| `LD_PRELOAD` | `/home/USERNAME/.local/share/linuwux/LinUwUx.so` |
+| `LD_PRELOAD` | `/home/USERNAME/.local/share/artitux/Artitux.so` |
 
-The wrapper always loads the installed LinUwUx library and prepends it to any
-existing `LD_PRELOAD` value. Use an absolute path without spaces or colons.
+The wrapper always loads the installed Artitux library. It puts the library
+first in the existing `LD_PRELOAD` value. Use an absolute path with no spaces
+and no colons.
 
 ## Configuration
 
-LinUwUx needs no extra variables by default. A CPUID identity request from a
-mapped `reflex64.dll` client automatically selects the legacy CPU and KUSER
-presentation before Reflex begins its control handshake. Once `artifact.dll`
-is mapped in the game process, CPUID identity requests use the
-CPU values from the AMD SimpleSvm or Intel HyperDbg source profile, according
-to the host CPU vendor. Artifact's Intel CPUID profile clears AVX feature bits
-even with `PROTON_AVX=1`. A complete explicit
-dual-dispatch registration selects the legacy presentation for later identity
-requests.
+Artitux needs no variables by default. You can set these variables:
 
-| Variable | Behaviour |
+| Variable | Effect |
 | --- | --- |
-| `PROTON_AVX=1` | Enables AVX flags for the resume-target profile |
-| `LINUWUX_SYSCALL_HACK=1` | Clears Wine's `KUSER_SHARED_DATA.SystemCall` flag (direct syscall path). Opt-in per title; not implied by Reflex |
-| `LINUWUX_LEGACY_PROFILE=1` | Selects legacy CPU presentation and selector-dispatch handling while retaining the ResumeTarget registration protocol; it uses the SVM KUSER recipe on AMD and the VMX KUSER recipe on Intel |
-| `LINUWUX_WIN32U_FREE_GUARD=1` | Enables `win32u` duplicate-`free` protection for games that need it; disabled by default |
-| `LINUWUX_DEBUG=1` | Enables runtime diagnostics |
-| `LINUWUX_LOG=/absolute/path.log` | Writes diagnostics to a private `0600` file |
+| `ARTITUX_DEBUG=1` | Turns on runtime diagnostics |
+| `ARTITUX_LOG=/absolute/path.log` | Writes diagnostics to a private file with mode `0600` |
+| `PROTON_AVX=1` | Reports AVX in the default CPU presentation. It has no effect with `ARTITUX_LEGACY_PROFILE=1`, which always reports AVX |
+| `ARTITUX_SYSCALL_HACK=1` | Clears Wine's `KUSER_SHARED_DATA.SystemCall` flag, so Wine uses the direct syscall path. Set it only for titles that need it |
+| `ARTITUX_LEGACY_PROFILE=1` | Uses the generic LinUwUx CPU presentation for the whole process |
+| `ARTITUX_WIN32U_FREE_GUARD=1` | Turns on the guard against a duplicate `free` in `win32u`. It is off by default |
+| `ARTITUX_RESOLVER_BRIDGE=0` | Turns off the Artifact resolver bridge. Use it only for diagnosis. Artifact games need the bridge |
+| `ARTITUX_ARTIFACT_NATIVE_STUBS=0` | Turns off Artitux's native Artifact stubs. Use it only for diagnosis. Artifact games need the stubs |
 
-`LinUwUx` is an internal process marker and should not be set manually.
+The first time Artitux runs in a process tree, it sets
+`PROTON_DISABLE_LSTEAMCLIENT=1`. It does not change this variable if it already
+has a value that is not empty.
 
-The launched game executable (a non-`system32` `.exe`) gets CPUID trapping
-and native DLL overrides. When enabled, the `win32u` duplicate-`free` guard
-tracks the most recent 1,024 pointers without scanning the whole history on
-every allocation. Wine helpers only append `HwProfileGuid` to an
-existing `$WINEPREFIX/system.reg`. LinUwUx also sets
-`PROTON_DISABLE_LSTEAMCLIENT=1` on first run in a process tree, unless it is
-already set to a nonzero value.
-
-Reflex protocol: every title starts (and stays) resume-target regardless of
-handshake shape (`0x69696969` DISPATCH_INIT before or after `ARM_TARGET`,
-any stub alignment) — this covers `reflex64.dll`/SMT5V, `winmm.dll`/FC6,
-ACBFR, and TopSpin 2K25 alike, since their stub code is byte-identical and
-handshake ordering/alignment reflects each build's own linker layout, not
-protocol intent. Dual dispatch (HM/LADPIH) is the one unambiguous case: it
-requires an explicit later `DISPATCH_SYSTEM_ID`/`DISPATCH_ATTRIBUTES_*`
-leaf, which is the only reliable signal to upgrade off resume-target.
-`DenuvOwO=n,b` and `artifact=n,b` are native overrides applied to every
-detected game process (see above), not gated by files on disk.
-`LINUWUX_SYSCALL_HACK=1` is independent and is required for titles that need
-the direct syscall path.
+On CPUs with more than 16 threads, Artitux also sets `WINE_CPU_TOPOLOGY`. Wine
+then uses only the first 16 CPUs that the game can run on, for example
+`16:0,1,2,…,15`. Artifact reports at most 16 processors, and Wine must use the
+same count. If the counts are different, Wine's random-number calls fail and
+some games stop at startup. For example, Planet Zoo 2 shows
+`DStorageGetFactory: 0x80004001`. If you set `WINE_CPU_TOPOLOGY` yourself,
+Artitux uses your value.
 
 ## Troubleshooting
 
-- **`linuwux: command not found`:** Use the full wrapper path or add
+- `artitux: command not found`: Use the wrapper's full path, or add
   `~/.local/bin` to `PATH`.
-- **The game does not launch:** Try `linuwux %command%` without other wrappers.
-  For containerised launchers, check that the wrapper and library are visible in
-  the sandbox and that the runner starts a 64-bit Wine host.
+- The game does not start: Try `/home/USERNAME/.local/bin/artitux %command%`
+  with no other wrappers. For launchers that run in a container, make sure that
+  the sandbox can see the wrapper and the library. Also make sure that the
+  runner starts a 64-bit Wine host.
 
 To collect a debug log, use:
 
 ```text
-LINUWUX_DEBUG=1 LINUWUX_LOG=/tmp/linuwux.log linuwux %command%
+ARTITUX_DEBUG=1 ARTITUX_LOG=/tmp/artitux.log /home/USERNAME/.local/bin/artitux %command%
 ```
 
-Remove the debug variables afterwards. To report a problem, open a
-[bug report](https://github.com/brcly/linuwux-runtime/issues/new?template=bug_report.yml)
-and attach the full LinUwUx log plus the Proton, UMU, or launcher log. See
-[CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
-before opening a pull request, and report security issues privately per
-[SECURITY.md](SECURITY.md).
+After you collect the log, remove the debug variables. To report a problem,
+open a
+[bug report](https://github.com/Lumice/artitux/issues/new?template=bug_report.yml).
+Attach the full Artitux log and the Proton, UMU, or launcher log. Before you
+open a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md). Report security
+issues privately, as [SECURITY.md](SECURITY.md) describes.
 
 ## Build from source
 
-Install Rust 1.98 or newer, a native C linker, and GNU binutils, then run:
+Install Rust 1.98 or newer, a native C linker, and GNU binutils. Then run:
 
 ```sh
 cargo xtask build
 ```
 
-The finished library is `target/runtime/LinUwUx.so`. You can also use:
+The build writes the library to `target/runtime/Artitux.so`. You can also use:
 
 ```sh
 cargo xtask build --debug
-cargo xtask build --output /absolute/path/LinUwUx.so
+cargo xtask build --output /absolute/path/Artitux.so
 ```
 
-`--debug` writes to `target/runtime-debug/LinUwUx.so` instead.
+With `--debug`, the build writes to `target/runtime-debug/Artitux.so` instead.
 
-The build checks the public exports, constructor order, ELF architecture, and
-linker hardening.
+The build checks the public exports, the constructor order, the ELF
+architecture, and the linker hardening.
 
 ## Uninstall
 
 ```sh
-rm "$HOME/.local/bin/linuwux"
-rm "$HOME/.local/share/linuwux/LinUwUx.so"
+rm -f "$HOME/.local/bin/artitux" "$HOME/.local/share/artitux/Artitux.so"
 ```
 
-If you used `--global`, also remove the optional system launcher:
-
-```sh
-sudo rm /usr/local/bin/linuwux
-```
-
-Remove `linuwux` or the direct `LD_PRELOAD` entry from each launcher too.
+If you installed with `install.sh --global`, also remove
+`/usr/local/bin/artitux`. Then remove `artitux` or the `LD_PRELOAD` entry from
+each launcher.
 
 ## AI disclosure
 
-I used AI during debugging, testing, and parts of the documentation. Hate it as
-much as you want; it saved me a lot of time staring at memory addresses and
-helped me think through ideas which never made it into the project. I also used
-it as another pair of eyes while checking a few small pieces of code for
-performance regressions.
+AI coding assistants helped develop this fork. Each change was tested with a
+build, the unit tests, an independent code review, and live game tests.
 
-## License
+## License and credits
 
-LinUwUx is distributed under the terms in [LICENSE](LICENSE).
+Artitux is distributed under the terms in [LICENSE](LICENSE) (AGPL-3.0).
 
-## Star History
-
-<a href="https://star-history.com/#brcly/linuwux-runtime&Date">
-  <picture>
-    <source
-      media="(prefers-color-scheme: dark)"
-      srcset="https://api.star-history.com/svg?repos=brcly/linuwux-runtime&type=Date&theme=dark"
-    >
-    <img
-      alt="LinUwUx star history"
-      src="https://api.star-history.com/svg?repos=brcly/linuwux-runtime&type=Date"
-    >
-  </picture>
-</a>
-
-## Credits
-
-- LinUwUx - original Proton patch
+Artitux is a fork of [LinUwUx](https://github.com/brcly/linuwux-runtime) by
+brcly (`Copyright (C) 2026 LinUwUx`, AGPL-3.0). Lumice forked and modified it
+in November 2026.

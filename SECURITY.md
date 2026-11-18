@@ -12,7 +12,7 @@
 
 Do not report security vulnerabilities in public issues, discussions, pull
 requests, or release comments. Use [GitHub Private Vulnerability
-Reporting](https://github.com/brcly/linuwux-runtime/security/advisories/new)
+Reporting](https://github.com/Lumice/artitux/security/advisories/new)
 instead.
 
 Include a clear description of the impact, affected versions, reproduction
@@ -25,7 +25,7 @@ disclosure after affected users have a reasonable opportunity to update.
 
 ## Scope
 
-This policy covers vulnerabilities in the LinUwUx runtime, wrapper, installer,
+This policy covers vulnerabilities in the Artitux runtime, wrapper, installer,
 and release artifacts. It does not cover compatibility bugs without a security
 impact or vulnerabilities in Wine, Proton, games, launchers, Linux
-distributions, or drivers that LinUwUx does not maintain.
+distributions, or drivers that Artitux does not maintain.

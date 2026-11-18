@@ -1,13 +1,13 @@
 # Open issue: TopSpin crash with the legacy syscall hack removed
 
-This is a conclusions-only summary. It exists so `LINUWUX_SYSCALL_HACK`
+This is a conclusions-only summary. It exists so `ARTITUX_SYSCALL_HACK`
 removal (tracked in the syscall-routing plan) stays gated on this being
 resolved, without carrying the full blow-by-blow investigation log into
 permanent history. The detailed trace history lives outside this repo.
 
 ## Status
 
-Unresolved. With `LINUWUX_SYSCALL_HACK` off (the target, KUSER-route-only
+Unresolved. With `ARTITUX_SYSCALL_HACK` off (the target, KUSER-route-only
 behavior described in [`syscall-routing.md`](syscall-routing.md)), TopSpin
 reaches a successful `NtFreeVirtualMemory(MEM_RELEASE)` release and then
 faults inside Wine's `ntdll!A_SHAFinal` reading `[RCX+0x30]` with `RCX=0`

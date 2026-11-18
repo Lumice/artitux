@@ -1,42 +1,14 @@
 //! Reads and writes this process's own memory through
 //! `process_vm_readv`/`process_vm_writev`, so probing an address that may not
 //! be mapped fails a syscall instead of faulting. Safe to use from the
-//! SIGSEGV/SIGSYS handlers.
+//! SIGSEGV/SIGSYS handlers. The current PID is queried for every operation:
+//! raw `SYS_fork` bypasses pthread-atfork handlers and invalidates PID caches.
 #![cfg_attr(
     not(all(feature = "syscall", feature = "kuser", feature = "reflex")),
     allow(dead_code)
 )]
 
 use core::ffi::c_void;
-#[cfg(feature = "hooks")]
-use core::sync::atomic::{AtomicI32, Ordering};
-
-// glibc no longer caches getpid(), so every access would otherwise cost a
-// second syscall. The cache is only sound while a fork child resets it, which
-// `hooks.rs` does from its `pthread_atfork` handler.
-#[cfg(feature = "hooks")]
-static PID: AtomicI32 = AtomicI32::new(0);
-
-#[cfg(feature = "hooks")]
-fn pid() -> libc::pid_t {
-    let cached = PID.load(Ordering::Relaxed);
-    if cached != 0 {
-        return cached;
-    }
-    let pid = unsafe { libc::getpid() };
-    PID.store(pid, Ordering::Relaxed);
-    pid
-}
-
-#[cfg(not(feature = "hooks"))]
-fn pid() -> libc::pid_t {
-    unsafe { libc::getpid() }
-}
-
-#[cfg(feature = "hooks")]
-pub(crate) fn forget_pid_after_fork() {
-    PID.store(0, Ordering::Relaxed);
-}
 
 pub(crate) fn read_memory(address: u64, output: &mut [u8]) -> bool {
     if address == 0 || output.is_empty() {
@@ -50,7 +22,9 @@ pub(crate) fn read_memory(address: u64, output: &mut [u8]) -> bool {
         iov_base: address as *mut c_void,
         iov_len: output.len(),
     };
-    unsafe { libc::process_vm_readv(pid(), &local, 1, &remote, 1, 0) == output.len() as isize }
+    unsafe {
+        libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) == output.len() as isize
+    }
 }
 
 fn write_memory(address: u64, bytes: &[u8]) -> bool {
@@ -62,7 +36,9 @@ fn write_memory(address: u64, bytes: &[u8]) -> bool {
         iov_base: address as *mut c_void,
         iov_len: bytes.len(),
     };
-    unsafe { libc::process_vm_writev(pid(), &local, 1, &remote, 1, 0) == bytes.len() as isize }
+    unsafe {
+        libc::process_vm_writev(libc::getpid(), &local, 1, &remote, 1, 0) == bytes.len() as isize
+    }
 }
 
 pub(crate) fn write_u64(address: u64, value: u64) -> bool {

@@ -1,16 +1,16 @@
 //! Owns the live `KUSER_SHARED_DATA` page at `ADDRESS`: applies the byte
 //! recipes the safe core describes (`protocol/kuser.rs::Recipe`) under a
 //! `crate::page_guard::PageGuard`, and — separately — the legacy
-//! `LINUWUX_SYSCALL_HACK` mechanism (see below).
+//! `ARTITUX_SYSCALL_HACK` mechanism (see below).
+use artitux::kuser::{PAGE_SIZE, PatchError, PatchState, Recipe};
 use core::ffi::{CStr, c_char, c_int};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
-use linuwux::kuser::{PAGE_SIZE, PatchError, PatchState, Recipe};
 
 const ADDRESS: usize = 0x7ffe_0000;
 /// `KUSER_SHARED_DATA.SystemCall`: nonzero routes Wine's ntdll syscall
 /// stubs through the KUSER dispatcher slot (the target design — see
-/// `docs/protocol/syscall-routing.md`); the legacy `LINUWUX_SYSCALL_HACK`
+/// `docs/protocol/syscall-routing.md`); the legacy `ARTITUX_SYSCALL_HACK`
 /// path clears it so stubs take the direct `syscall` branch instead. This is
 /// meant to be removed, not extended: it stays only because one supported
 /// title (TopSpin) still crashes without it and the root cause isn't found
@@ -18,7 +18,7 @@ const ADDRESS: usize = 0x7ffe_0000;
 /// callers of `syscall_hack_enabled()`; the dispatcher bridge
 /// (`syscall/kuser_dispatch.rs`) is the mechanism new code should rely on.
 const SYSTEM_CALL_OFFSET: usize = 0x308;
-const SYSCALL_HACK_ENV: &CStr = c"LINUWUX_SYSCALL_HACK";
+const SYSCALL_HACK_ENV: &CStr = c"ARTITUX_SYSCALL_HACK";
 static PAGE_GEOMETRY_SUPPORTED: AtomicBool = AtomicBool::new(false);
 static AVX_ENABLED: AtomicBool = AtomicBool::new(false);
 static SYSCALL_HACK_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -114,15 +114,13 @@ unsafe fn apply_recipe_to_shared_page(
 }
 
 fn syscall_hack_enabled() -> bool {
-    if !SYSCALL_HACK_ENABLED.load(Ordering::Acquire) {
-        return false;
-    }
+    let enabled = SYSCALL_HACK_ENABLED.load(Ordering::Acquire);
     #[cfg(feature = "environment")]
     {
-        crate::environment::game_process()
+        enabled && crate::environment::game_process()
     }
     #[cfg(not(feature = "environment"))]
-    true
+    enabled
 }
 
 #[cfg(feature = "hooks")]
@@ -194,7 +192,7 @@ pub unsafe extern "C" fn patch_kuser_shared_data() -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn linuwux_setup_kuser() {
+pub unsafe extern "C" fn artitux_setup_kuser() {
     let avx = unsafe {
         let avx_value = libc::getenv(c"PROTON_AVX".as_ptr());
         !avx_value.is_null() && CStr::from_ptr(avx_value).to_bytes() == b"1"
@@ -224,4 +222,4 @@ pub unsafe extern "C" fn linuwux_setup_kuser() {
 
 #[used]
 #[unsafe(link_section = ".init_array.00204")]
-static INITIALIZE: unsafe extern "C" fn() = linuwux_setup_kuser;
+static INITIALIZE: unsafe extern "C" fn() = artitux_setup_kuser;

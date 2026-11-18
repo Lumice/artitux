@@ -3,6 +3,7 @@ on:
   push:
     tags:
       - "v*"
+      - "!v*-*"
 permissions:
   contents: write
 jobs:
@@ -10,14 +11,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
       - run: cargo xtask build
-      - run: readelf -W --version-info target/runtime/LinUwUx.so
+      - run: readelf -W --version-info target/runtime/Artitux.so
       - run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" target/runtime/LinUwUx.so --clobber
+            gh release upload "$GITHUB_REF_NAME" target/runtime/Artitux.so --clobber
           else
-            gh release create "$GITHUB_REF_NAME" target/runtime/LinUwUx.so --title "$GITHUB_REF_NAME" --generate-notes
+            gh release create "$GITHUB_REF_NAME" target/runtime/Artitux.so --title "$GITHUB_REF_NAME" --generate-notes
           fi
         env:
           GH_TOKEN: ${{ github.token }}

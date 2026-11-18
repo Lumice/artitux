@@ -2,14 +2,14 @@
 //! calls through `unsafe extern "C"` declarations (rather than a normal Rust
 //! `fn`, since `debug` is an optional feature other modules must be able to
 //! link against without depending on this crate's internals). Reads
-//! `LINUWUX_DEBUG`/`LINUWUX_LOG` once at startup, opens the log file with
+//! `ARTITUX_DEBUG`/`ARTITUX_LOG` once at startup, opens the log file with
 //! the `O_NOFOLLOW`/`0600` hardening a world-writable log path would
 //! otherwise need, and builds each line with `protocol::debug::Line`, the
 //! `no_std`-safe formatter this file's callers can't allocate to use.
+use artitux::debug::Line;
 use core::ffi::{CStr, c_char, c_int};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use linuwux::debug::Line;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LOG_FD: AtomicI32 = AtomicI32::new(-1);
@@ -160,11 +160,11 @@ pub extern "C" fn debug_runtime_activated() {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn linuwux_setup_debug() {
+pub unsafe extern "C" fn artitux_setup_debug() {
     unsafe {
-        let value = libc::getenv(c"LINUWUX_DEBUG".as_ptr());
-        let path = libc::getenv(c"LINUWUX_LOG".as_ptr());
-        let enabled = linuwux::debug::enabled(if value.is_null() {
+        let value = libc::getenv(c"ARTITUX_DEBUG".as_ptr());
+        let path = libc::getenv(c"ARTITUX_LOG".as_ptr());
+        let enabled = artitux::debug::enabled(if value.is_null() {
             None
         } else {
             Some(CStr::from_ptr(value).to_bytes())
@@ -186,4 +186,4 @@ pub unsafe extern "C" fn linuwux_setup_debug() {
 
 #[used]
 #[unsafe(link_section = ".init_array.00102")]
-static INITIALIZE: unsafe extern "C" fn() = linuwux_setup_debug;
+static INITIALIZE: unsafe extern "C" fn() = artitux_setup_debug;

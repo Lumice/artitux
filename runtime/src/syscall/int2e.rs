@@ -160,14 +160,14 @@ fn build_or_reuse_private_trampoline(index: usize, site: u64, next: u64) -> Opti
     {
         Ok(_) => Some(built),
         Err(existing) => {
-            unsafe { libc::munmap(built as *mut c_void, linuwux::kuser::PAGE_SIZE) };
+            unsafe { libc::munmap(built as *mut c_void, artitux::kuser::PAGE_SIZE) };
             Some(existing)
         }
     }
 }
 
 fn build_private_trampoline(site: u64, next: u64) -> Option<u64> {
-    let page_size = linuwux::kuser::PAGE_SIZE;
+    let page_size = artitux::kuser::PAGE_SIZE;
     let page = site & !(page_size as u64 - 1);
     executable_mapping_protection(page, page_size as u64)?;
     let _errno = crate::errno::Errno::save();
@@ -322,7 +322,7 @@ fn patch_to_syscall(address: u64) -> bool {
     if !read_memory(address, &mut original) || original != INT2E_INSTRUCTION {
         return false;
     }
-    let page_size = linuwux::kuser::PAGE_SIZE as u64;
+    let page_size = artitux::kuser::PAGE_SIZE as u64;
     let page = address & !(page_size - 1);
     let Some(second_byte) = address.checked_add(1) else {
         return false;

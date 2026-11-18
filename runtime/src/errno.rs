@@ -1,4 +1,4 @@
-//! Saves and restores `errno` across a block of LinUwUx's own libc calls, so
+//! Saves and restores `errno` across a block of Artitux's own libc calls, so
 //! interposed functions (`malloc`, `free`, `gettimeofday`, ...) never leak
 //! their internal syscalls' errno into the caller's. Construct at the top of
 //! a function with `let _errno = Errno::save();`; the restore happens in

@@ -1,9 +1,9 @@
 [package]
-name = "linuwux-rust"
-version = "26.9.16"
+name = "artitux-rust"
+version = "1.0.0"
 edition = "2024"
 rust-version.workspace = true
-description = "Rust preload runtime and safe protocol core for LinUwUx"
+description = "Rust preload runtime and safe protocol core for Artitux"
 license-file = "LICENSE"
 publish = false
 
@@ -22,7 +22,7 @@ panic = "abort"
 panic = "abort"
 
 [lib]
-name = "linuwux"
+name = "artitux"
 path = "protocol/lib.rs"
 
 [workspace.lints.rust]

@@ -1,13 +1,12 @@
-//! Installs LinUwUx's own handler in Wine's KUSER dispatcher slot and
+//! Installs Artitux's own handler in Wine's KUSER dispatcher slot and
 //! classifies every call that arrives through it.
 //!
-//! This boundary answers exactly one question per call: is this evidenced as
-//! Reflex's own copied syscall stub (found by scanning the main PE image's
-//! IAT for Reflex's trampolines), or is it an ordinary call on Wine's own
-//! dispatcher? It does not decide anything about Reflex protocol semantics
-//! (selectors, registration, routing) — that happens afterward, at the
-//! SIGSYS boundary in [`super::sigsys_router`], once the classified call has
-//! either been left on Wine's dispatcher or replayed as a raw syscall.
+//! Reflex calls require a copied stub discovered through its IAT and caller
+//! evidence. A positively registered ART process instead recognizes Wine's
+//! CALL-through-KUSER stubs directly. Both replay the evidenced raw SYSCALL;
+//! marked ART bypasses instead retain Wine's original dispatcher and receive
+//! the source contract's service/XMM normalization. Protocol semantics are
+//! handled afterward at the [`super::sigsys_router`] boundary.
 //!
 //! See `docs/protocol/syscall-routing.md` for how this fits into the overall
 //! design, and [`should_replay_raw`] for the actual classification rule.
@@ -22,6 +21,26 @@ const WINE_DISPATCHER_SLOT: u64 = 0x7ffe_1000;
 const THUNK_RETURN_OFFSET: u64 = 0x1f;
 const IAT_CAPACITY: usize = 4096;
 const RAW_TARGET_TAG: u64 = 1 << 63;
+
+// Exact saved frame constructed by dispatcher_bridge before changing stacks.
+#[cfg(feature = "artifact")]
+#[repr(C)]
+struct DispatcherFrame {
+    registers: [u64; 15], // R15..RAX, as pushed by the bridge.
+    flags: u64,
+    xmm: [[u64; 2]; 16],
+    target: u64,
+    return_address: u64,
+}
+
+#[cfg(feature = "artifact")]
+const _: () = assert!(
+    core::mem::offset_of!(DispatcherFrame, flags) == 0x78
+        && core::mem::offset_of!(DispatcherFrame, xmm) == 0x80
+        && core::mem::offset_of!(DispatcherFrame, target) == 0x180
+        && core::mem::offset_of!(DispatcherFrame, return_address) == 0x188
+        && core::mem::size_of::<DispatcherFrame>() == 0x190
+);
 const SYSCALL_INSTRUCTION: [u8; 2] = [0x0f, 0x05];
 const PEB_IMAGE_BASE_OFFSET: u64 = 0x10;
 const TEB_PEB_OFFSET: u64 = 0x60;
@@ -397,6 +416,31 @@ fn find_syscall(return_address: u64, service: u64) -> Option<u64> {
     None
 }
 
+/// Recognize Wine's CALL-through-KUSER thunk before bypassing the narrower
+/// Reflex IAT/caller filters. The service, SystemCall branch, and CALL slot
+/// must all belong to this same stub; an unrelated nearby SYSCALL is not
+/// sufficient evidence.
+fn find_artifact_wine_syscall(return_address: u64, service: u64) -> Option<u64> {
+    let start = stub_for_return(return_address)?;
+    let service = u32::try_from(service).ok()?;
+    let mut code = [0u8; 32];
+    if !read_memory(start, &mut code)
+        || code[..4] != [0x4c, 0x8b, 0xd1, 0xb8]
+        || code[4..8] != service.to_le_bytes()
+        || code[8..0x15]
+            != [
+                0xf6, 0x04, 0x25, 0x08, 0x03, 0xfe, 0x7f, 0x01, 0x75, 0x03, 0x0f, 0x05, 0xc3,
+            ]
+        || code[0x15..]
+            != [
+                0xeb, 0x01, 0xc3, 0xff, 0x14, 0x25, 0x00, 0x10, 0xfe, 0x7f, 0xc3,
+            ]
+    {
+        return None;
+    }
+    start.checked_add(0x12)
+}
+
 /// The evidence `dispatcher_target` gathers for one KUSER dispatcher call,
 /// in the order it becomes available (cheapest first, so the expensive
 /// `find_syscall` memory scan is only attempted once the cheaper checks
@@ -415,19 +459,13 @@ struct DispatchEvidence {
     raw_syscall_found: bool,
 }
 
-/// The actual routing rule: replay this call as a raw syscall only when it
-/// is evidenced as Reflex's own copied stub — matched by the IAT scan,
-/// called from outside Reflex's own image, with a raw syscall instruction to
-/// replay. Anything else stays on Wine's original dispatcher. This is the
-/// one piece of `dispatcher_target`'s classification with no pointers or
-/// I/O, so it is what `docs/protocol/syscall-routing.md` invariant 2 (route
-/// from runtime evidence, not fixed addresses) and the tests below can pin
-/// down directly.
-fn should_replay_raw(evidence: DispatchEvidence) -> bool {
+/// Reflex requires the IAT/caller evidence. A registered ART callback instead
+/// uses an independently recognized Wine CALL thunk; both paths require the
+/// original dispatcher and a matching raw SYSCALL.
+fn should_replay_raw(evidence: DispatchEvidence, artifact: bool) -> bool {
     evidence.original_dispatcher_known
-        && evidence.stub_match
-        && !evidence.caller_is_reflex_image
         && evidence.raw_syscall_found
+        && (artifact || (evidence.stub_match && !evidence.caller_is_reflex_image))
 }
 
 /// The KUSER dispatcher bridge's Rust selector, called from
@@ -440,41 +478,109 @@ unsafe extern "C" fn dispatcher_target(
     return_address: u64,
     service: u64,
     r10: u64,
-    _process_handle: u64,
-    _xmm5: u64,
+    _saved_frame: *mut c_void,
+    xmm5: u64,
     entry_rsp: u64,
 ) -> u64 {
     let _ = r10;
     let original = ORIGINAL_DISPATCHER.load(Ordering::Acquire);
-    maybe_scan_main_image_iat();
-    super::unixlib_repair::maybe_repair_wine_unixlib_exports();
+    #[cfg(feature = "artifact")]
+    let artifact = crate::artifact::active() && crate::artifact::syscall_target().is_some();
+    #[cfg(not(feature = "artifact"))]
+    let artifact = false;
+    #[cfg(feature = "artifact")]
+    {
+        // SAFETY: dispatcher_bridge saved the complete, exclusively owned
+        // frame before switching to the selector's private stack.
+        let frame = unsafe { &mut *_saved_frame.cast::<DispatcherFrame>() };
+        unsafe {
+            dispatcher_target_for_frame(
+                return_address,
+                service,
+                entry_rsp,
+                original,
+                artifact,
+                xmm5,
+                frame,
+            )
+        }
+    }
+    #[cfg(not(feature = "artifact"))]
+    {
+        let _ = xmm5;
+        unsafe {
+            dispatcher_target_for_process(return_address, service, entry_rsp, original, artifact)
+        }
+    }
+}
+
+unsafe fn dispatcher_target_for_process(
+    return_address: u64,
+    service: u64,
+    entry_rsp: u64,
+    original: u64,
+    artifact: bool,
+) -> u64 {
+    #[cfg(feature = "artifact")]
+    let _dispatch_guard = unsafe { crate::artifact::wine_dispatch_guard() };
+    if !artifact {
+        maybe_scan_main_image_iat();
+        super::unixlib_repair::maybe_repair_wine_unixlib_exports();
+    }
     let trap_rsp = entry_rsp.saturating_add(8);
+    #[cfg(feature = "artifact")]
+    if artifact {
+        super::artifact_flags::retire(trap_rsp);
+    }
     let mut tid = 0;
     if super::reflex_markers::has_active_markers() {
         tid = unsafe { libc::gettid() as u64 };
         super::reflex_markers::retire_markers(tid, trap_rsp);
     }
 
-    let stub_match = matches_iat_stub(return_address);
-    if original == 0 || !stub_match {
+    if original == 0 {
         return original;
     }
-    let caller = read_u64(entry_rsp.saturating_add(8)).unwrap_or(0);
-    let caller_is_reflex_image = is_reflex_address(caller);
-    if caller_is_reflex_image {
+    let stub_match = !artifact && matches_iat_stub(return_address);
+    if !artifact && !stub_match {
         return original;
     }
-    let raw = find_syscall(return_address, service);
-    if !should_replay_raw(DispatchEvidence {
-        original_dispatcher_known: true,
-        stub_match: true,
-        caller_is_reflex_image,
-        raw_syscall_found: raw.is_some(),
-    }) {
+    let caller_is_reflex_image =
+        !artifact && is_reflex_address(read_u64(entry_rsp.saturating_add(8)).unwrap_or(0));
+    if !artifact && caller_is_reflex_image {
+        return original;
+    }
+    let raw = if artifact {
+        find_artifact_wine_syscall(return_address, service)
+    } else {
+        find_syscall(return_address, service)
+    };
+    if !should_replay_raw(
+        DispatchEvidence {
+            original_dispatcher_known: true,
+            stub_match,
+            caller_is_reflex_image,
+            raw_syscall_found: raw.is_some(),
+        },
+        artifact,
+    ) {
         return original;
     }
     let raw = raw.expect("raw_syscall_found was checked above");
     let trap_rip = raw.saturating_add(2);
+    #[cfg(feature = "artifact")]
+    if artifact {
+        // Keep ART's per-call flags independently of the Reflex marker
+        // table, including when a later same-site call must be re-armed.
+        if !super::artifact_flags::reserve(trap_rsp, trap_rip) {
+            const MESSAGE: &[u8] = b"Artitux: ART syscall flag storage unavailable\n";
+            unsafe {
+                libc::write(libc::STDERR_FILENO, MESSAGE.as_ptr().cast(), MESSAGE.len());
+                libc::_exit(127);
+            }
+        }
+        return raw | RAW_TARGET_TAG;
+    }
     if tid == 0 {
         tid = unsafe { libc::gettid() as u64 };
     }
@@ -482,6 +588,31 @@ unsafe extern "C" fn dispatcher_target(
         return original;
     }
     raw | RAW_TARGET_TAG
+}
+
+#[cfg(feature = "artifact")]
+unsafe fn dispatcher_target_for_frame(
+    return_address: u64,
+    service: u64,
+    entry_rsp: u64,
+    original: u64,
+    artifact: bool,
+    xmm5: u64,
+    frame: &mut DispatcherFrame,
+) -> u64 {
+    if artifact && original != 0 && xmm5 == artitux::artifact::SYSCALL_BYPASS_MAGIC {
+        // The source contract applies before canonical-stub decoding: even
+        // noncanonical callers carry a real service in EAX. Leave their
+        // continuation, flags, arguments and nonvolatile state untouched.
+        let service = u64::from(service as u32);
+        frame.registers[14] = service;
+        frame.xmm[4] = [service, 0];
+        frame.xmm[5] = [0, 0];
+        // An ordinary bypass never reserves/retires raw-replay flag frames,
+        // changes the selector, or executes a Windows ID as a Linux syscall.
+        return original;
+    }
+    unsafe { dispatcher_target_for_process(return_address, service, entry_rsp, original, artifact) }
 }
 
 /// Private stacks for the bridge's Rust selector, one slot per Windows thread
@@ -516,7 +647,7 @@ unsafe extern "C" fn dispatcher_bridge() {
         "movdqu [rsp + 0xc0], xmm12", "movdqu [rsp + 0xd0], xmm13", "movdqu [rsp + 0xe0], xmm14", "movdqu [rsp + 0xf0], xmm15",
         "pushfq", "push rax", "push rbx", "push rcx", "push rdx", "push rsi", "push rdi", "push rbp", "push r8", "push r9", "push r10", "push r11", "push r12", "push r13", "push r14", "push r15",
         "mov rbx, rsp",
-        "mov rdi, [rbx + 0x188]", "lea r9, [rbx + 0x188]", "mov rsi, [rbx + 0x70]", "mov rdx, [rbx + 0x28]", "mov rcx, [rbx + 0x60]", "mov r8, [rbx + 0xd0]",
+        "mov rdi, [rbx + 0x188]", "lea r9, [rbx + 0x188]", "mov rsi, [rbx + 0x70]", "mov rdx, [rbx + 0x28]", "mov rcx, rbx", "mov r8, [rbx + 0xd0]",
         // Run the Rust selector on a private per-thread stack. Everything
         // above this point is spilled to the Windows stack inside a fixed
         // 0x190-byte frame, like the Reflex handler itself; the selector's
@@ -589,52 +720,137 @@ unsafe extern "C" fn dispatcher_bridge() {
     );
 }
 
+fn dispatcher_page_protection(page: u64, size: u64) -> Option<libc::c_int> {
+    let end = page.checked_add(size)?;
+    let mut protection = None;
+    crate::maps::find_line(|line| {
+        let Some(mapping) = crate::maps::parse(line) else {
+            return false;
+        };
+        if mapping.start > page || mapping.end < end {
+            return false;
+        }
+        let permissions = mapping.permissions;
+        if permissions.len() != 4
+            || permissions[0] != b'r'
+            || !matches!(permissions[1], b'w' | b'-')
+            || !matches!(permissions[2], b'x' | b'-')
+            || !matches!(permissions[3], b'p' | b's')
+        {
+            return true;
+        }
+        let mut flags = libc::PROT_READ;
+        if permissions[1] == b'w' {
+            flags |= libc::PROT_WRITE;
+        }
+        if permissions[2] == b'x' {
+            flags |= libc::PROT_EXEC;
+        }
+        protection = Some(flags);
+        true
+    });
+    protection
+}
+
+/// The caller holds `PageGuard` and has prepared the ART page, if applicable.
+unsafe fn swap_dispatcher_slot(
+    slot: *mut u64,
+    bridge: u64,
+    original: &AtomicU64,
+    expected_original: Option<u64>,
+) -> bool {
+    let address = slot as u64;
+    let size = artitux::kuser::PAGE_SIZE as u64;
+    let page = address & !(size - 1);
+    let Some(page_end) = page.checked_add(size) else {
+        return false;
+    };
+    if address == 0
+        || !address.is_multiple_of(8)
+        || address.checked_add(8).is_none_or(|end| end > page_end)
+    {
+        return false;
+    }
+    let Some(protection) = dispatcher_page_protection(page, size) else {
+        return false;
+    };
+    let change_protection = protection & libc::PROT_WRITE == 0;
+    if change_protection
+        && unsafe {
+            libc::mprotect(
+                page as *mut c_void,
+                size as usize,
+                protection | libc::PROT_WRITE,
+            )
+        } != 0
+    {
+        return false;
+    }
+    let observed = unsafe { slot.read_volatile() };
+    let installed = observed != 0
+        && observed != bridge
+        && expected_original.is_none_or(|expected| observed == expected);
+    let previous_original = original.load(Ordering::Acquire);
+    let already_installed = observed == bridge && previous_original != 0;
+    if installed {
+        original.store(observed, Ordering::Release);
+        unsafe { slot.write_volatile(bridge) };
+    }
+    let restored = !change_protection
+        || unsafe { libc::mprotect(page as *mut c_void, size as usize, protection) } == 0;
+    if !restored {
+        if installed {
+            // The failed restore leaves the page writable. Do not leave a
+            // bridge installed when its installation was reported as failed.
+            unsafe { slot.write_volatile(observed) };
+            original.store(previous_original, Ordering::Release);
+        }
+        return false;
+    }
+    installed || already_installed
+}
+
 /// Swap Wine's KUSER dispatcher slot for [`dispatcher_bridge`]. Idempotent;
 /// safe to call repeatedly until Wine has populated the slot (see the retry
-/// note in `kuser.rs::linuwux_setup_kuser`).
+/// note in `kuser.rs::artitux_setup_kuser`).
 pub(super) fn install() -> bool {
+    #[cfg(feature = "artifact")]
+    let verify_slot = crate::artifact::detected();
+    #[cfg(not(feature = "artifact"))]
+    let verify_slot = false;
+    let slot = WINE_DISPATCHER_SLOT as *mut u64;
+    let bridge = dispatcher_bridge as *const () as u64;
     if BRIDGE_INSTALLED.load(Ordering::Acquire) {
-        return true;
+        if !verify_slot {
+            return true;
+        }
+        if ORIGINAL_DISPATCHER.load(Ordering::Acquire) != 0
+            && read_u64(WINE_DISPATCHER_SLOT) == Some(bridge)
+        {
+            return true;
+        }
     }
     let Some(_guard) = crate::page_guard::PageGuard::acquire() else {
         log_install_failure();
         return false;
     };
-    if BRIDGE_INSTALLED.load(Ordering::Acquire) {
+    let cached = BRIDGE_INSTALLED.load(Ordering::Acquire);
+    if cached && !verify_slot {
         return true;
     }
-    let page = WINE_DISPATCHER_SLOT & !(linuwux::kuser::PAGE_SIZE as u64 - 1);
-    // Wine owns this shared KUSER page. Temporarily make it writable to swap
-    // the dispatcher slot, then restore the page's read-only protection.
-    if unsafe {
-        libc::mprotect(
-            page as *mut c_void,
-            linuwux::kuser::PAGE_SIZE,
-            libc::PROT_READ | libc::PROT_WRITE,
-        )
-    } == -1
-    {
-        log_install_failure();
-        return false;
+    let known_original = ORIGINAL_DISPATCHER.load(Ordering::Acquire);
+    if cached && verify_slot {
+        match read_u64(WINE_DISPATCHER_SLOT) {
+            Some(value) if value == bridge && known_original != 0 => return true,
+            Some(value) if value == known_original && known_original != 0 => {}
+            _ => {
+                log_install_failure();
+                return false;
+            }
+        }
     }
-    // The slot is readable, and the page was made writable above.
-    let slot = WINE_DISPATCHER_SLOT as *mut u64;
-    let original = unsafe { slot.read_volatile() };
-    let bridge = dispatcher_bridge as *const () as u64;
-    let installed = original != 0 && original != bridge;
-    let already_installed = original == bridge && ORIGINAL_DISPATCHER.load(Ordering::Acquire) != 0;
-    if installed {
-        ORIGINAL_DISPATCHER.store(original, Ordering::Release);
-        unsafe { slot.write_volatile(bridge) };
-    }
-    let restored = unsafe {
-        libc::mprotect(
-            page as *mut c_void,
-            linuwux::kuser::PAGE_SIZE,
-            libc::PROT_READ,
-        )
-    } != -1;
-    if (installed || already_installed) && restored {
+    let expected_original = (verify_slot && known_original != 0).then_some(known_original);
+    if unsafe { swap_dispatcher_slot(slot, bridge, &ORIGINAL_DISPATCHER, expected_original) } {
         BRIDGE_INSTALLED.store(true, Ordering::Release);
         if !BRIDGE_INSTALL_SUCCESS_LOGGED.swap(true, Ordering::AcqRel) {
             log(c"reflex bridge installed");
@@ -695,24 +911,653 @@ mod tests {
             caller_is_reflex_image: false,
             raw_syscall_found: true,
         };
-        assert!(should_replay_raw(all_true));
+        assert!(should_replay_raw(all_true, false));
 
-        assert!(!should_replay_raw(DispatchEvidence {
-            original_dispatcher_known: false,
-            ..all_true
-        }));
-        assert!(!should_replay_raw(DispatchEvidence {
+        assert!(!should_replay_raw(
+            DispatchEvidence {
+                original_dispatcher_known: false,
+                ..all_true
+            },
+            false
+        ));
+        assert!(!should_replay_raw(
+            DispatchEvidence {
+                stub_match: false,
+                ..all_true
+            },
+            false
+        ));
+        assert!(!should_replay_raw(
+            DispatchEvidence {
+                caller_is_reflex_image: true,
+                ..all_true
+            },
+            false
+        ));
+        assert!(!should_replay_raw(
+            DispatchEvidence {
+                raw_syscall_found: false,
+                ..all_true
+            },
+            false
+        ));
+    }
+
+    #[cfg(feature = "artifact")]
+    #[test]
+    fn artifact_policy_does_not_apply_reflex_iat_or_caller_filters() {
+        let evidence = DispatchEvidence {
+            original_dispatcher_known: true,
             stub_match: false,
-            ..all_true
-        }));
-        assert!(!should_replay_raw(DispatchEvidence {
             caller_is_reflex_image: true,
-            ..all_true
-        }));
-        assert!(!should_replay_raw(DispatchEvidence {
-            raw_syscall_found: false,
-            ..all_true
-        }));
+            raw_syscall_found: true,
+        };
+        assert!(should_replay_raw(evidence, true));
+        assert!(!should_replay_raw(evidence, false));
+        assert!(!should_replay_raw(
+            DispatchEvidence {
+                original_dispatcher_known: false,
+                ..evidence
+            },
+            true
+        ));
+        assert!(!should_replay_raw(
+            DispatchEvidence {
+                raw_syscall_found: false,
+                ..evidence
+            },
+            true
+        ));
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    struct WineCallStub {
+        code: Box<[u8; 256]>,
+        stack: Box<[u64; 2]>,
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    impl WineCallStub {
+        const START: usize = 128;
+        const SERVICE: u64 = 0x246;
+        const ORIGINAL: u64 = 0x1122_3344_5566;
+
+        fn new() -> Self {
+            let mut code = Box::new([0x90; 256]);
+            code[Self::START..Self::START + 32].copy_from_slice(&[
+                0x4c, 0x8b, 0xd1, 0xb8, 0x46, 0x02, 0x00, 0x00, 0xf6, 0x04, 0x25, 0x08, 0x03, 0xfe,
+                0x7f, 0x01, 0x75, 0x03, 0x0f, 0x05, 0xc3, 0xeb, 0x01, 0xc3, 0xff, 0x14, 0x25, 0x00,
+                0x10, 0xfe, 0x7f, 0xc3,
+            ]);
+            let return_address = unsafe { code.as_ptr().add(Self::START + 0x1f) } as u64;
+            let stack = Box::new([return_address, 0x7766_5544_3322]);
+            Self { code, stack }
+        }
+
+        fn select(&self, service: u64, original: u64, artifact: bool) -> u64 {
+            unsafe {
+                super::dispatcher_target_for_process(
+                    self.stack[0],
+                    service,
+                    self.stack.as_ptr() as u64,
+                    original,
+                    artifact,
+                )
+            }
+        }
+
+        fn raw_address(&self) -> u64 {
+            (unsafe { self.code.as_ptr().add(Self::START + 0x12) }) as u64
+        }
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    impl Drop for WineCallStub {
+        fn drop(&mut self) {
+            super::super::reflex_markers::cancel(
+                unsafe { libc::gettid() as u64 },
+                self.stack.as_ptr() as u64 + 8,
+                self.raw_address() + 2,
+            );
+        }
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    fn bypass_frame() -> super::DispatcherFrame {
+        super::DispatcherFrame {
+            registers: [0xa1a2_a3a4_a5a6_a7a8; 15],
+            flags: 0x247,
+            xmm: [[0x1122_3344_5566_7788, 0x8877_6655_4433_2211]; 16],
+            target: 0,
+            return_address: 0,
+        }
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    #[test]
+    fn artifact_ordinary_bypass_uses_original_for_canonical_and_unknown_callers() {
+        let fixture = WineCallStub::new();
+        let marker = artitux::artifact::SYSCALL_BYPASS_MAGIC;
+        let return_address = fixture.stack[0];
+        for (caller, service) in [
+            (return_address, WineCallStub::SERVICE),
+            (1, 0x1234_5678_0000_0246),
+        ] {
+            let mut frame = bypass_frame();
+            frame.registers[14] = service;
+            frame.xmm[5] = [marker, 0xfeed_face_dead_beef];
+            let original_registers = frame.registers;
+            let original_xmm = frame.xmm;
+            let selected = unsafe {
+                super::dispatcher_target_for_frame(
+                    caller,
+                    service,
+                    fixture.stack.as_ptr() as u64,
+                    WineCallStub::ORIGINAL,
+                    true,
+                    marker,
+                    &mut frame,
+                )
+            };
+            assert_eq!(
+                selected,
+                WineCallStub::ORIGINAL,
+                "a bypass must never replay raw SYSCALL"
+            );
+            let mut expected_registers = original_registers;
+            expected_registers[14] = 0x246;
+            assert_eq!(frame.registers, expected_registers);
+            assert_eq!(frame.flags, 0x247);
+            for (index, expected) in original_xmm.iter().enumerate() {
+                assert_eq!(
+                    frame.xmm[index],
+                    match index {
+                        4 => [0x246, 0],
+                        5 => [0, 0],
+                        _ => *expected,
+                    }
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    #[test]
+    fn artifact_ordinary_bypass_does_not_retire_a_pending_outer_flag_frame() {
+        let fixture = WineCallStub::new();
+        let stack = fixture.stack.as_ptr() as u64 + 8;
+        let rip = fixture.raw_address() + 2;
+        assert!(super::super::artifact_flags::reserve(stack, rip));
+        super::super::artifact_flags::route(stack, rip, 0x8d7, 0x202);
+        let marker = artitux::artifact::SYSCALL_BYPASS_MAGIC;
+        let mut frame = bypass_frame();
+        frame.xmm[5] = [marker, 0xfeed_face_dead_beef];
+        unsafe {
+            super::dispatcher_target_for_frame(
+                fixture.stack[0],
+                WineCallStub::SERVICE,
+                fixture.stack.as_ptr() as u64,
+                WineCallStub::ORIGINAL,
+                true,
+                marker,
+                &mut frame,
+            );
+        }
+        let saved = super::super::artifact_flags::bypass(stack, rip)
+            .expect("ordinary bypass must not retire or reserve raw replay state");
+        assert_eq!((saved.r11, saved.eflags), (0x8d7, 0x202));
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    #[test]
+    fn artifact_ordinary_bypass_leaves_non_target_and_unmarked_frames_unchanged() {
+        let fixture = WineCallStub::new();
+        for (artifact, marker) in [
+            (false, artitux::artifact::SYSCALL_BYPASS_MAGIC),
+            (true, 0x1337_1337_1337_1337),
+        ] {
+            let mut frame = bypass_frame();
+            frame.xmm[5][0] = marker;
+            let (registers, xmm, flags) = (frame.registers, frame.xmm, frame.flags);
+            let selected = unsafe {
+                super::dispatcher_target_for_frame(
+                    1,
+                    0x1234_5678_0000_0246,
+                    fixture.stack.as_ptr() as u64,
+                    WineCallStub::ORIGINAL,
+                    artifact,
+                    marker,
+                    &mut frame,
+                )
+            };
+            assert_eq!(selected, WineCallStub::ORIGINAL);
+            assert_eq!(
+                (frame.registers, frame.xmm, frame.flags),
+                (registers, xmm, flags)
+            );
+        }
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    #[unsafe(naked)]
+    unsafe extern "C" fn owned_bypass_original_dispatcher() {
+        // Owned original-dispatcher stand-in records its actual incoming
+        // state and returns a real, read-only Linux getpid result.
+        core::arch::naked_asm!(
+            "mov [rdi], rax",
+            "mov [rdi + 8], rcx",
+            "mov [rdi + 16], r11",
+            "mov [rdi + 24], rsp",
+            "pushfq",
+            "pop qword ptr [rdi + 32]",
+            "movdqu [rdi + 40], xmm4",
+            "movdqu [rdi + 56], xmm5",
+            "mov eax, 39",
+            "syscall",
+            "ret",
+        );
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    #[test]
+    fn artifact_ordinary_bypass_machine_bridge_preserves_real_outcome_flags_and_stack() {
+        const CHILD: &str = "ARTITUX_UNIT_ORDINARY_BYPASS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .env(CHILD, "1")
+                .args(["--exact", "syscall::kuser_dispatch::tests::artifact_ordinary_bypass_machine_bridge_preserves_real_outcome_flags_and_stack", "--test-threads=1"])
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let mut teb = [0u64; 0x80];
+        teb[0x48 / 8] = 0x1a0;
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_arch_prctl, 0x1001i64, teb.as_mut_ptr()) },
+            0
+        );
+        crate::artifact::mark_detected();
+        crate::artifact_loader::arm_for_test();
+        crate::artifact::cpuid(0x1337, 0, 1, artitux::cpuid::Vendor::Amd);
+        crate::artifact::cpuid(0x336933, 0x1234_0000, 0, artitux::cpuid::Vendor::Amd);
+        assert!(crate::artifact::active());
+        assert_eq!(crate::artifact::syscall_target(), Some(0x1234_0000));
+        super::ORIGINAL_DISPATCHER.store(
+            owned_bypass_original_dispatcher as *const () as u64,
+            core::sync::atomic::Ordering::Release,
+        );
+        let mut capture = [0u64; 13];
+        let marker = [
+            artitux::artifact::SYSCALL_BYPASS_MAGIC,
+            0xfeed_face_dead_beef,
+        ];
+        unsafe {
+            core::arch::asm!(
+                "mov [rdi + 72], rsp",
+                "push 0x247", "popfq", "pushfq", "pop qword ptr [rdi + 80]",
+                "mov rax, 0x1234567800000246",
+                "mov rcx, 0x1122334455667788", "mov r11, 0x8877665544332211",
+                "movdqu xmm5, [rsi]", "call r12",
+                "mov [rdi + 88], rsp", "mov [rdi + 96], rax",
+                in("rdi") capture.as_mut_ptr(), in("rsi") marker.as_ptr(),
+                in("r12") super::dispatcher_bridge as *const (),
+                clobber_abi("C"),
+            );
+        }
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_arch_prctl, 0x1001i64, 0usize) },
+            0
+        );
+        assert_eq!(capture[0], 0x246);
+        assert_eq!(capture[1], 0x1122_3344_5566_7788);
+        assert_eq!(capture[2], 0x8877_6655_4433_2211);
+        assert_eq!(capture[3], capture[9] - 8);
+        assert_eq!(capture[4], capture[10]);
+        assert_eq!(&capture[5..7], &[0x246, 0]);
+        assert_eq!(&capture[7..9], &[0, 0]);
+        assert_eq!(capture[9], capture[11]);
+        assert_eq!(capture[12], unsafe { libc::getpid() } as u64);
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    #[test]
+    fn artifact_dispatcher_replays_recognized_wine_call_stub_without_iat_match() {
+        let fixture = WineCallStub::new();
+        assert_eq!(
+            fixture.select(WineCallStub::SERVICE, WineCallStub::ORIGINAL, true),
+            fixture.raw_address() | super::RAW_TARGET_TAG,
+        );
+        assert_eq!(
+            fixture.select(WineCallStub::SERVICE, WineCallStub::ORIGINAL, false),
+            WineCallStub::ORIGINAL,
+        );
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    #[test]
+    fn artifact_dispatcher_routes_when_reflex_marker_table_is_saturated() {
+        use std::time::{Duration, Instant};
+
+        const CHILD_ENV: &str = "ARTITUX_UNIT_ARTIFACT_SATURATION_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // This exact test was self-execed in an isolated test process.
+            // Filling its real marker table cannot starve parallel tests.
+            let fixture = WineCallStub::new();
+            let mut signal_fixture = super::super::sigsys_router::artifact_tests::Fixture::new(2);
+            let rsp = fixture.stack.as_ptr() as u64 + 8;
+            let expected = fixture.raw_address();
+            let recognized =
+                super::find_artifact_wine_syscall(fixture.stack[0], WineCallStub::SERVICE)
+                    == Some(expected);
+            let mut saturated = false;
+            for index in 0..65_536u64 {
+                let tid = 0xf000_0000_0000_0000 | (index + 1);
+                let stack = 0x1000 + index * 16;
+                let rip = 0x2000 + index * 16;
+                if !super::super::reflex_markers::remember_marker(tid, stack, rip) {
+                    saturated = true;
+                    break;
+                }
+            }
+            let selected = fixture.select(WineCallStub::SERVICE, WineCallStub::ORIGINAL, true);
+            let status = if !recognized {
+                12
+            } else if !saturated {
+                10
+            } else if selected != (expected | super::RAW_TARGET_TAG) {
+                11
+            } else {
+                let outcome =
+                    signal_fixture.saturated_roundtrip(rsp, expected + 2, WineCallStub::SERVICE);
+                if outcome != 0 {
+                    outcome
+                } else if fixture.select(WineCallStub::SERVICE, WineCallStub::ORIGINAL, true)
+                    != (expected | super::RAW_TARGET_TAG)
+                {
+                    20
+                } else {
+                    let repeated = signal_fixture.saturated_reused_site(
+                        rsp,
+                        expected + 2,
+                        WineCallStub::SERVICE,
+                    );
+                    if repeated == 0 { 42 } else { repeated }
+                }
+            };
+            unsafe { libc::_exit(status) };
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("syscall::kuser_dispatch::tests::artifact_dispatcher_routes_when_reflex_marker_table_is_saturated")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env_remove("ARTITUX_DEBUG")
+            .env_remove("ARTITUX_LOG")
+            .env_remove("WINEPREFIX")
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("marker saturation child timed out");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "child status: 10=not saturated, 11=Wine fallback, 12=invalid stub, \
+             13=route declined, 14=callback ABI, 15=bypass handled, \
+             16=flags/request not restored, 17=FPU state, 18=fork failure, \
+             19=forked child inherited pending flags, 20-24=reused-site failure"
+        );
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    #[test]
+    fn artifact_dispatcher_reinstalls_after_raw_fork_rollback_without_overwriting_foreign_slot() {
+        use core::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe { libc::alarm(8) };
+            crate::artifact::mark_detected();
+            super::BRIDGE_INSTALLED.store(false, Ordering::Release);
+            super::ORIGINAL_DISPATCHER.store(0, Ordering::Release);
+            let address = super::WINE_DISPATCHER_SLOT as *mut libc::c_void;
+            let mapped = unsafe {
+                libc::mmap(
+                    address,
+                    0x1000,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if mapped != address {
+                unsafe { libc::_exit(20) };
+            }
+            let slot = mapped.cast::<u64>();
+            unsafe {
+                core::ptr::write_bytes(mapped.cast::<u8>(), 0xa5, 0x1000);
+                slot.write_volatile(WineCallStub::ORIGINAL);
+            }
+            if unsafe { libc::mprotect(mapped, 0x1000, libc::PROT_READ) } != 0 {
+                unsafe { libc::_exit(21) };
+            }
+            let bridge = super::dispatcher_bridge as *const () as u64;
+            if !super::install() || unsafe { slot.read_volatile() } != bridge {
+                unsafe { libc::_exit(22) };
+            }
+
+            // Warm process-memory's PID before a raw fork between bridge
+            // installation and provider commit. SYS_fork bypasses atfork.
+            if crate::procmem::read_u64(super::WINE_DISPATCHER_SLOT) != Some(bridge) {
+                unsafe { libc::_exit(34) };
+            }
+            let grandchild = unsafe { libc::syscall(libc::SYS_fork) } as libc::pid_t;
+            if grandchild < 0 {
+                unsafe { libc::_exit(23) };
+            }
+            if grandchild == 0 {
+                unsafe { libc::alarm(5) };
+                if unsafe { libc::mprotect(mapped, 0x1000, libc::PROT_READ | libc::PROT_WRITE) }
+                    != 0
+                {
+                    unsafe { libc::_exit(24) };
+                }
+                // Model the provider's child rollback of its staged page.
+                unsafe { slot.write_volatile(WineCallStub::ORIGINAL) };
+                let canary = unsafe { mapped.cast::<u8>().add(0x20).cast::<u32>() };
+                let wrote_self = crate::procmem::write_u32(canary as u64, 0x4433_2211)
+                    && unsafe { canary.read_volatile() } == 0x4433_2211;
+                unsafe { canary.write_volatile(0xa5a5_a5a5) };
+                if unsafe { libc::mprotect(mapped, 0x1000, libc::PROT_READ) } != 0 {
+                    unsafe { libc::_exit(25) };
+                }
+                let read_self = crate::procmem::read_u64(super::WINE_DISPATCHER_SLOT)
+                    == Some(WineCallStub::ORIGINAL);
+                let installed = super::install();
+                if !read_self {
+                    unsafe { libc::_exit(35) };
+                }
+                if !wrote_self {
+                    unsafe { libc::_exit(36) };
+                }
+                if !installed || unsafe { slot.read_volatile() } != bridge {
+                    unsafe { libc::_exit(26) };
+                }
+                if unsafe { mapped.cast::<u8>().add(0x20).read() } != 0xa5 {
+                    unsafe { libc::_exit(27) };
+                }
+
+                if unsafe { libc::mprotect(mapped, 0x1000, libc::PROT_READ | libc::PROT_WRITE) }
+                    != 0
+                {
+                    unsafe { libc::_exit(28) };
+                }
+                let foreign = 0x3344_5566_7788u64;
+                unsafe { slot.write_volatile(foreign) };
+                if unsafe { libc::mprotect(mapped, 0x1000, libc::PROT_READ) } != 0 {
+                    unsafe { libc::_exit(29) };
+                }
+                if super::install() || unsafe { slot.read_volatile() } != foreign {
+                    unsafe { libc::_exit(30) };
+                }
+                unsafe { libc::_exit(0) };
+            }
+            let mut status = 0;
+            loop {
+                let waited = unsafe { libc::waitpid(grandchild, &mut status, 0) };
+                if waited == grandchild {
+                    break;
+                }
+                if waited < 0 && unsafe { *libc::__errno_location() } != libc::EINTR {
+                    unsafe { libc::_exit(31) };
+                }
+            }
+            if !libc::WIFEXITED(status) {
+                unsafe { libc::_exit(32) };
+            }
+            let result = libc::WEXITSTATUS(status);
+            if result != 0 {
+                unsafe { libc::_exit(result) };
+            }
+            if unsafe { slot.read_volatile() } != bridge
+                || unsafe { mapped.cast::<u8>().add(0x20).read() } != 0xa5
+            {
+                unsafe { libc::_exit(33) };
+            }
+            unsafe { libc::_exit(0) };
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut status = 0;
+        loop {
+            let waited = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+            if waited == child {
+                break;
+            }
+            if waited < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    panic!("waitpid failed: {error}");
+                }
+            }
+            if Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(child, libc::SIGKILL);
+                    libc::waitpid(child, &mut status, 0);
+                }
+                panic!("dispatcher install child timed out");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            libc::WIFEXITED(status),
+            "dispatcher child terminated: {status:#x}"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "child status 26=rollback ignored, 30=foreign slot accepted, \
+             35=raw-fork self-read used another PID, 36=raw-fork self-write \
+             used another PID; 20-25,27-29,31-34=fixture/setup failures"
+        );
+    }
+
+    #[cfg(all(feature = "artifact", not(miri)))]
+    #[test]
+    fn artifact_dispatcher_falls_back_for_wrong_service_signature_or_missing_wine_target() {
+        let mut fixture = WineCallStub::new();
+        assert_eq!(
+            fixture.select(WineCallStub::SERVICE + 1, WineCallStub::ORIGINAL, true),
+            WineCallStub::ORIGINAL
+        );
+        assert_eq!(fixture.select(WineCallStub::SERVICE, 0, true), 0);
+        for offset in [0, 0x0b, 0x18, 0x1d] {
+            let byte = WineCallStub::START + offset;
+            fixture.code[byte] ^= 1;
+            assert_eq!(
+                fixture.select(WineCallStub::SERVICE, WineCallStub::ORIGINAL, true),
+                WineCallStub::ORIGINAL,
+                "corrupted Wine stub offset {offset:#x}",
+            );
+            fixture.code[byte] ^= 1;
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn artifact_dispatcher_install_preserves_mapping_permissions_and_unrelated_bytes() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        struct Page(*mut u8);
+        impl Drop for Page {
+            fn drop(&mut self) {
+                unsafe { libc::munmap(self.0.cast(), 0x1000) };
+            }
+        }
+        fn permissions(address: u64) -> String {
+            std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let (start, end) = fields.next()?.split_once('-')?;
+                    let start = u64::from_str_radix(start, 16).ok()?;
+                    let end = u64::from_str_radix(end, 16).ok()?;
+                    (start <= address && address < end).then(|| fields.next().unwrap().to_owned())
+                })
+                .expect("test page is mapped")
+        }
+
+        for (protection, expected) in [
+            (libc::PROT_READ, "r--p"),
+            (libc::PROT_READ | libc::PROT_WRITE, "rw-p"),
+            (libc::PROT_READ | libc::PROT_EXEC, "r-xp"),
+            (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC, "rwxp"),
+        ] {
+            let mapping = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    0x1000,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(mapping, libc::MAP_FAILED);
+            let page = Page(mapping.cast());
+            let slot = unsafe { page.0.add(16).cast::<u64>() };
+            unsafe {
+                core::ptr::write_bytes(page.0, 0xa5, 0x1000);
+                slot.write(0x1122_3344_5566_7788);
+            }
+            assert_eq!(unsafe { libc::mprotect(mapping, 0x1000, protection) }, 0);
+            assert_eq!(permissions(page.0 as u64), expected);
+
+            let saved = AtomicU64::new(0);
+            assert!(unsafe {
+                super::swap_dispatcher_slot(slot, 0x8877_6655_4433_2211, &saved, None)
+            });
+            assert_eq!(saved.load(Ordering::Acquire), 0x1122_3344_5566_7788);
+            assert_eq!(unsafe { slot.read() }, 0x8877_6655_4433_2211);
+            assert_eq!(permissions(page.0 as u64), expected);
+            for offset in [0, 8, 24, 0xfff] {
+                assert_eq!(unsafe { page.0.add(offset).read() }, 0xa5);
+            }
+        }
     }
 
     #[test]

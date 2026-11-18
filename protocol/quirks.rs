@@ -1,6 +1,6 @@
 //! Per-title reference data for the Reflex protocol differences documented
 //! in `docs/protocol/game-quirks.md`. This is *reference* data, not a
-//! dispatch table: LinUwUx's actual protocol logic (CPU vendor/AVX
+//! dispatch table: Artitux's actual protocol logic (CPU vendor/AVX
 //! detection, KUSER recipe selection, Reflex identity-scope tracking) is
 //! already driven by live CPUID/registration probing — see `cpuid.rs` and
 //! `reflex/state.rs` — not by branching on which title is running. What

@@ -9,7 +9,7 @@ use core::ffi::c_char;
 use core::ffi::{CStr, c_void};
 
 const REGISTRY_NAME: &CStr = c"/system.reg";
-const DONE_ENV: &CStr = c"LINUWUX_HWPROFILE";
+const DONE_ENV: &CStr = c"ARTITUX_HWPROFILE";
 const WINE_REGISTRY_MAGIC: &[u8] = b"WINE REGISTRY";
 const PROFILE_MARKER: &[u8] = b"Hardware Profiles\\\\0001";
 const GUID_MARKER: &[u8] = b"HwProfileGuid";
@@ -153,6 +153,3 @@ pub(crate) fn init_registry() {
         log(c"hwprofile_guid: failed to write HwProfileGuid into system.reg");
     }
 }
-
-#[cfg(feature = "reflex")]
-pub(crate) fn set_hwprofile_guid() {}

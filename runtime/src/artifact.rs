@@ -1,0 +1,309 @@
+//! ARTIFACT coordination on Artitux's existing signal and dispatcher engine.
+
+use artitux::artifact::{CpuidAction, State};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+struct SessionCoordinator {
+    owner: AtomicI32,
+    state: State,
+}
+
+impl SessionCoordinator {
+    const fn new() -> Self {
+        Self {
+            owner: AtomicI32::new(0),
+            state: State::new(),
+        }
+    }
+
+    // A negative owner means one thread is clearing inherited state. Other
+    // signal handlers must decline instead of waiting on that thread.
+    fn claim(&self, pid: libc::pid_t) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        let owner = self.owner.load(Ordering::Acquire);
+        if owner == pid {
+            return true;
+        }
+        if owner == -pid
+            || self
+                .owner
+                .compare_exchange(owner, -pid, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        self.state.after_fork();
+        self.owner.store(pid, Ordering::Release);
+        true
+    }
+
+    fn is_active(&self, pid: libc::pid_t) -> bool {
+        pid > 0 && self.owner.load(Ordering::Acquire) == pid && self.state.has_target_process()
+    }
+
+    fn syscall_target(&self, pid: libc::pid_t) -> Option<u64> {
+        if !self.is_active(pid) {
+            return None;
+        }
+        self.state.route_syscall().map(|route| route.target)
+    }
+
+    fn cpuid(&self, pid: libc::pid_t, leaf: u32, rcx: u64, rdx: u64, ready: bool) -> CpuidAction {
+        if !self.claim(pid) {
+            return CpuidAction::Native;
+        }
+        self.state.cpuid(leaf, rcx, rdx, ready)
+    }
+
+    fn after_fork(&self) {
+        self.owner.store(0, Ordering::Release);
+        self.state.after_fork();
+    }
+}
+
+static SESSION: SessionCoordinator = SessionCoordinator::new();
+static INITIALIZING: AtomicI32 = AtomicI32::new(0);
+static DETECTED: AtomicBool = AtomicBool::new(false);
+static FSGSBASE_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+fn trace_stage(message: &core::ffi::CStr) {
+    #[cfg(feature = "debug")]
+    unsafe {
+        crate::debug::debug_log(message.as_ptr())
+    };
+    #[cfg(not(feature = "debug"))]
+    let _ = message;
+}
+
+#[cfg(feature = "debug")]
+static TRACED_PROTOCOL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn trace_protocol(bit: u32, message: &core::ffi::CStr) {
+    #[cfg(feature = "debug")]
+    if TRACED_PROTOCOL.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        trace_stage(message);
+    }
+    #[cfg(not(feature = "debug"))]
+    let _ = (bit, message);
+}
+
+extern "C" fn initialize_capabilities() {
+    // Linux exposes this bit only when userspace FSGSBASE is enabled.
+    let available = unsafe { libc::getauxval(libc::AT_HWCAP2) } & 2 != 0;
+    FSGSBASE_AVAILABLE.store(available, Ordering::Release);
+}
+
+#[used]
+#[unsafe(link_section = ".init_array.00101")]
+static INITIALIZE_CAPABILITIES: extern "C" fn() = initialize_capabilities;
+
+pub(crate) fn mark_detected() {
+    DETECTED.store(true, Ordering::Release);
+}
+
+pub(crate) fn detected() -> bool {
+    DETECTED.load(Ordering::Acquire)
+}
+
+pub(crate) fn active() -> bool {
+    let Some(_guard) = (unsafe { wine_dispatch_guard() }) else {
+        return false;
+    };
+    SESSION.is_active(unsafe { libc::getpid() })
+}
+
+pub(crate) fn syscall_target() -> Option<u64> {
+    let _guard = unsafe { wine_dispatch_guard() }?;
+    SESSION.syscall_target(unsafe { libc::getpid() })
+}
+
+pub(crate) fn cpuid(leaf: u32, rcx: u64, rdx: u64, vendor: artitux::cpuid::Vendor) -> CpuidAction {
+    // Register, handler and readiness are Artifact-only protocol leaves:
+    // Artifact is running, so the loader boundary must already be armed.
+    if matches!(leaf, 0x1337 | 0x336933 | 0x1338) {
+        crate::artifact_loader::require_armed();
+    }
+    let Some(_guard) = (unsafe { wine_dispatch_guard() }) else {
+        return CpuidAction::Native;
+    };
+    let pid = unsafe { libc::getpid() };
+    if leaf == 0x1337 {
+        trace_protocol(1, c"ART protocol register observed");
+    }
+    if leaf == 0x336933 {
+        trace_protocol(2, c"ART protocol handler observed");
+    }
+    if leaf == 0x1338 && SESSION.is_active(pid) {
+        crate::artifact_kuser::apply_profile(vendor);
+    }
+    let provider_ready = leaf == 0x1338 && crate::artifact_kuser::profile_ready();
+    let action = SESSION.cpuid(pid, leaf, rcx, rdx, provider_ready);
+    if action == CpuidAction::Ready {
+        trace_protocol(4, c"ART protocol readiness delivered");
+    }
+    if action == CpuidAction::Query {
+        trace_protocol(8, c"ART protocol profile query observed");
+    }
+    if leaf == 0x1337 && SESSION.is_active(pid) {
+        crate::artifact_kuser::apply_profile(vendor);
+    }
+    action
+}
+
+#[derive(Debug)]
+pub(crate) enum InitializeError {
+    UnsupportedGsBaseAccess,
+    NotWineThread,
+    Busy,
+    Provider(crate::artifact_kuser::PrepareError),
+    Dispatcher,
+}
+
+/// Only an ordinary Wine PE thread with an initialized TEB may call this.
+/// All allocations and native worker creation finish before ART DllMain runs.
+pub(crate) fn prepare() -> Result<(), InitializeError> {
+    if !FSGSBASE_AVAILABLE.load(Ordering::Acquire) {
+        return Err(InitializeError::UnsupportedGsBaseAccess);
+    }
+    mark_detected();
+    let Some(_dispatch) = (unsafe { wine_dispatch_guard() }) else {
+        return Err(InitializeError::NotWineThread);
+    };
+    trace_stage(c"ART prepare entered Wine context");
+    let pid = unsafe { libc::getpid() };
+    let previous = INITIALIZING.load(Ordering::Acquire);
+    if previous == pid
+        || INITIALIZING
+            .compare_exchange(previous, pid, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return Err(InitializeError::Busy);
+    }
+    struct InitializationGuard;
+    impl Drop for InitializationGuard {
+        fn drop(&mut self) {
+            INITIALIZING.store(0, Ordering::Release);
+        }
+    }
+    let _initializing = InitializationGuard;
+    if !SESSION.claim(pid) {
+        return Err(InitializeError::Busy);
+    }
+    if crate::artifact_kuser::ready() {
+        return Ok(());
+    }
+    trace_stage(c"ART prepare KUSER starting");
+    crate::artifact_kuser::prepare().map_err(InitializeError::Provider)?;
+    trace_stage(c"ART prepare KUSER completed");
+    if let Err(error) = crate::artifact_kuser::prepare_dispatch_page() {
+        crate::artifact_kuser::rollback().map_err(InitializeError::Provider)?;
+        return Err(InitializeError::Provider(error));
+    }
+    trace_stage(c"ART prepare dispatcher starting");
+    if !crate::syscall::install_wine_syscall_dispatcher_bridge() {
+        crate::artifact_kuser::rollback().map_err(InitializeError::Provider)?;
+        return Err(InitializeError::Dispatcher);
+    }
+    crate::artifact_kuser::commit();
+    trace_stage(c"ART prepare completed");
+    Ok(())
+}
+
+pub(crate) fn after_fork() {
+    #[cfg(feature = "debug")]
+    TRACED_PROTOCOL.store(0, Ordering::Relaxed);
+    DETECTED.store(false, Ordering::Release);
+    INITIALIZING.store(0, Ordering::Release);
+    SESSION.after_fork();
+    crate::artifact_kuser::after_fork();
+}
+
+pub(crate) struct SignalDispatchGuard(u8);
+
+/// Scope Linux syscalls on a Wine thread in a positively attributed process.
+/// RDGSBASE avoids issuing a denied syscall to find the TEB; Linux-only
+/// workers have GS=0 and must never access gs:[0x340].
+pub(crate) unsafe fn wine_dispatch_guard() -> Option<SignalDispatchGuard> {
+    if !detected() || !FSGSBASE_AVAILABLE.load(Ordering::Acquire) {
+        return None;
+    }
+    let gs: usize;
+    unsafe {
+        core::arch::asm!("rdgsbase {base}", base = out(reg) gs,
+            options(nomem, nostack, preserves_flags));
+    }
+    if gs == 0 {
+        return None;
+    }
+    let previous: u8;
+    unsafe {
+        core::arch::asm!(
+            "mov {previous}, byte ptr gs:[0x340]",
+            "mov byte ptr gs:[0x340], 0",
+            previous = out(reg_byte) previous,
+            options(nostack, preserves_flags),
+        );
+    }
+    Some(SignalDispatchGuard(previous))
+}
+
+impl Drop for SignalDispatchGuard {
+    fn drop(&mut self) {
+        unsafe {
+            core::arch::asm!("mov byte ptr gs:[0x340], {previous}",
+                previous = in(reg_byte) self.0, options(nostack, preserves_flags));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionCoordinator;
+    use artitux::artifact::CpuidAction;
+
+    #[test]
+    fn raw_fork_child_rejects_parent_route_and_registers_a_fresh_session() {
+        let session = SessionCoordinator::new();
+        let parent = unsafe { libc::getpid() };
+        session.cpuid(parent, 0x1337, 0, 0x174, false);
+        session.cpuid(parent, 0x336933, 0x1111_0000, 0, false);
+        assert!(session.is_active(parent));
+        assert_eq!(session.syscall_target(parent), Some(0x1111_0000));
+
+        let child = unsafe { libc::syscall(libc::SYS_fork) };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            let child_pid = unsafe { libc::getpid() };
+            let inherited_rejected =
+                !session.is_active(child_pid) && session.syscall_target(child_pid).is_none();
+            let reset = session.cpuid(child_pid, 0x336967, 0, 0, false) == CpuidAction::Native;
+            session.cpuid(child_pid, 0x1337, 0, 0x180, false);
+            session.cpuid(child_pid, 0x336933, 0x2222_0000, 0, false);
+            let registered = session.is_active(child_pid)
+                && session.syscall_target(child_pid) == Some(0x2222_0000);
+            let ready = crate::artifact_kuser::ready();
+            let no_fake_ready =
+                !ready && session.cpuid(child_pid, 0x1338, 0, 0, ready) == CpuidAction::Native;
+            unsafe {
+                libc::_exit(
+                    if inherited_rejected && reset && registered && no_fake_ready {
+                        0
+                    } else {
+                        1
+                    },
+                );
+            }
+        }
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(child as libc::pid_t, &mut status, 0) },
+            child as libc::pid_t
+        );
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert!(session.is_active(parent));
+        assert_eq!(session.syscall_target(parent), Some(0x1111_0000));
+    }
+}

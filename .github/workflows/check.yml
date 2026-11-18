@@ -12,11 +12,13 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo doc --workspace --no-deps --locked
+      - run: cargo xtask build
+      - run: readelf -W --version-info target/runtime/Artitux.so
       - name: Component lint configurations
         run: |
           for profile in dev release; do
-            for features in '' cpuid hooks reflex syscall kuser faketime gamescope debug environment cpuid,hooks,reflex,syscall cpuid,hooks,reflex,syscall,kuser cpuid,hooks,reflex,syscall,kuser,faketime,gamescope; do
-              cargo clippy -p linuwux-runtime --lib --profile "$profile" --no-default-features --features "$features" -- -D warnings
+            for features in '' cpuid hooks reflex syscall kuser artifact faketime gamescope debug environment cpuid,hooks,reflex,syscall cpuid,hooks,reflex,syscall,kuser cpuid,hooks,reflex,syscall,kuser,faketime,gamescope; do
+              cargo clippy -p artitux-runtime --lib --profile "$profile" --no-default-features --features "$features" -- -D warnings
             done
           done
   miri:
@@ -24,5 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal --component miri
-      - run: cargo +nightly miri test -p linuwux-runtime --lib
-      - run: cargo +nightly miri test -p linuwux-rust
+      # Artifact code relies on raw syscalls, mmap, signals and fork, which Miri
+      # cannot emulate; Miri covers the same feature set it did upstream.
+      - run: cargo +nightly miri test -p artitux-runtime --lib --no-default-features --features cpuid,hooks,reflex,syscall,kuser,faketime,gamescope,debug,environment
+      - run: cargo +nightly miri test -p artitux-rust

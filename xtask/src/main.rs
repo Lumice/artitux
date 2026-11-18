@@ -1,5 +1,5 @@
-//! `cargo xtask build`: builds `linuwux-runtime` as a static archive, links
-//! it into `LinUwUx.so` with an explicit version-script export map and
+//! `cargo xtask build`: builds `artitux-runtime` as a static archive, links
+//! it into `Artitux.so` with an explicit version-script export map and
 //! linker hardening flags, then verifies the result — exported symbols
 //! match [`EXPORTS`] exactly, the ELF has the expected hardening
 //! (`RELRO`/`BIND_NOW`/`NODELETE`/no executable stack/no text relocations),
@@ -32,7 +32,7 @@ const EXPORTS: &[&str] = &[
     "pread",
     "mmap",
     "unsetenv",
-    "linuwux_setup_hooks",
+    "artitux_setup_hooks",
     "forward_signal",
     "reflex_handle_cpuid",
     "reflex_route_syscall",
@@ -42,7 +42,7 @@ const EXPORTS: &[&str] = &[
     "patch_kuser_shared_data",
     "gettimeofday",
     "set_offset",
-    "linuwux_setup_faketime",
+    "artitux_setup_faketime",
     "setenv",
     "debug_enabled",
     "debug_runtime_activated",
@@ -51,20 +51,33 @@ const EXPORTS: &[&str] = &[
     "debug_log_dec",
 ];
 const ANCHORS: &[&str] = &[
-    "linuwux_setup_debug",
-    "linuwux_setup_gamescope",
-    "linuwux_setup_environment",
-    "linuwux_setup_faketime",
-    "linuwux_setup_hooks",
-    "linuwux_setup_kuser",
+    "artitux_setup_debug",
+    "artitux_setup_gamescope",
+    "artitux_setup_environment",
+    "artitux_setup_faketime",
+    "artitux_setup_hooks",
+    "artitux_setup_kuser",
 ];
 const INTERPOSITION_HOOKS: &[&str] = &["read", "pread", "mmap"];
+const ARTIFACT_EXPORTS: &[&str] = &[
+    "artitux_artifact_prepare",
+    "artitux_artifact_after_return",
+    "mprotect",
+];
+
+fn exports(artifact: bool) -> impl Iterator<Item = &'static str> {
+    EXPORTS
+        .iter()
+        .copied()
+        .chain(ARTIFACT_EXPORTS.iter().copied().filter(move |_| artifact))
+}
 
 struct Context {
     root: PathBuf,
     target: PathBuf,
     scratch: TempDir,
     debug: bool,
+    artifact: bool,
     cargo: OsString,
     cc: OsString,
 }
@@ -76,22 +89,19 @@ impl Context {
         cmd
     }
 
-    fn archive(&self, features: Option<&str>) -> Result<PathBuf> {
+    fn archive(&self) -> Result<PathBuf> {
         let mut cmd = self.cargo();
         cmd.args([
             "build",
             "--locked",
             "-p",
-            "linuwux-runtime",
+            "artitux-runtime",
             "--message-format=json-render-diagnostics",
         ]);
-        let target = if let Some(features) = features {
-            cmd.args(["--no-default-features", "--features", features]);
-            self.scratch.path().join("component-target")
-        } else {
-            self.target.clone()
-        };
-        cmd.arg("--target-dir").arg(&target);
+        if self.artifact {
+            cmd.args(["--features", "artifact"]);
+        }
+        cmd.arg("--target-dir").arg(&self.target);
         if !self.debug {
             cmd.arg("--release");
         }
@@ -101,7 +111,7 @@ impl Context {
                 continue;
             };
             if message["reason"] == "compiler-artifact"
-                && message["target"]["name"] == "linuwux_runtime"
+                && message["target"]["name"] == "artitux_runtime"
                 && let Some(files) = message["filenames"].as_array()
                 && let Some(file) = files
                     .iter()
@@ -139,8 +149,7 @@ impl Context {
             &map,
             format!(
                 "{{\n global:\n{} local: *;\n}};\n",
-                EXPORTS
-                    .iter()
+                exports(self.artifact)
                     .map(|name| format!(" {name};\n"))
                     .collect::<String>()
             ),
@@ -149,9 +158,9 @@ impl Context {
     }
 
     fn build(&self, output: &Path) -> Result<()> {
-        let archive = self.archive(None)?;
+        let archive = self.archive()?;
         let map = self.export_map()?;
-        let library = self.scratch.path().join("LinUwUx.so");
+        let library = self.scratch.path().join("Artitux.so");
         let mut cmd = self.compiler();
         cmd.args([
             "-shared",
@@ -165,6 +174,11 @@ impl Context {
         for hook in INTERPOSITION_HOOKS {
             cmd.arg(format!("-Wl,-u,{hook}"));
         }
+        if self.artifact {
+            for name in ARTIFACT_EXPORTS {
+                cmd.arg(format!("-Wl,-u,{name}"));
+            }
+        }
         cmd.arg(format!("-Wl,--version-script={}", map.display()))
             .arg(archive);
         self.finish_link(&mut cmd, &library)?;
@@ -172,7 +186,7 @@ impl Context {
         if !self.debug {
             process::checked(Command::new("strip").arg("--strip-unneeded").arg(&library))?;
         }
-        verify_elf(&library)?;
+        verify_elf(&library, self.artifact)?;
         let parent = output
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -185,13 +199,13 @@ impl Context {
             "Built {} ({} bytes, {} C ABI exports)",
             output.display(),
             fs::metadata(output)?.len(),
-            EXPORTS.len()
+            exports(self.artifact).count()
         );
         Ok(())
     }
 }
 
-fn verify_elf(library: &Path) -> Result<()> {
+fn verify_elf(library: &Path, artifact: bool) -> Result<()> {
     let output = process::checked(
         Command::new("nm")
             .args(["-D", "--defined-only"])
@@ -202,7 +216,7 @@ fn verify_elf(library: &Path) -> Result<()> {
         .lines()
         .filter_map(|line| line.split_whitespace().last())
         .collect();
-    let expected: BTreeSet<_> = EXPORTS.iter().copied().collect();
+    let expected: BTreeSet<_> = exports(artifact).collect();
     if actual != expected {
         return Err(format!(
             "export mismatch: missing {:?}, extra {:?}",
@@ -318,10 +332,13 @@ fn run() -> Result<()> {
         return Err("requires Linux x86-64 with glibc".into());
     }
     let mut debug = false;
+    let artifact = true;
     let mut output = None;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--debug") => debug = true,
+            // Artifact support is the default; the flag is kept for old scripts.
+            Some("--artifact") => {}
             Some("--output") => {
                 output = Some(PathBuf::from(
                     args.next().ok_or("--output requires a path")?,
@@ -354,13 +371,14 @@ fn run() -> Result<()> {
             .tempdir_in(&target)?,
         target,
         debug,
+        artifact,
         cargo,
         cc: env::var_os("CC").unwrap_or_else(|| "cc".into()),
     };
     let destination = output.clone().unwrap_or_else(|| {
         ctx.target
             .join(if debug { "runtime-debug" } else { "runtime" })
-            .join("LinUwUx.so")
+            .join("Artitux.so")
     });
     match command.to_str() {
         Some("build") => ctx.build(&destination),
@@ -368,5 +386,25 @@ fn run() -> Result<()> {
             "unknown command or missing required option: {command:?}; run cargo xtask help"
         )
         .into()),
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn artifact_build_adds_only_the_opt_in_entry_points_and_resolver_observer() {
+        let standard: BTreeSet<_> = exports(false).collect();
+        let artifact: BTreeSet<_> = exports(true).collect();
+        assert_eq!(standard, EXPORTS.iter().copied().collect());
+        assert_eq!(artifact.len(), standard.len() + 3);
+        assert_eq!(
+            artifact
+                .difference(&standard)
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            ARTIFACT_EXPORTS.iter().copied().collect()
+        );
     }
 }

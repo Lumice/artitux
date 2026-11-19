@@ -226,6 +226,46 @@ for entry in $preload; do
 done
 IFS=$old_ifs
 
+# Steam emulators shipped with a release (gbe_fork, Goldberg) can take the
+# app ID from the IDs Steam sets for a non-Steam shortcut. Give them the ID
+# from the release's own steam_settings/steam_appid.txt instead.
+# ARTITUX_STEAM_IDS=0 turns this off.
+steam_ids() {
+    if [ "${ARTITUX_STEAM_IDS-1}" = 0 ]; then
+        return 0
+    fi
+    for arg in "$@"; do
+        case "$arg" in
+            *.[eE][xX][eE]) ;;
+            *) continue ;;
+        esac
+        if [ ! -f "$arg" ]; then
+            continue
+        fi
+        case "$arg" in
+            */*) dir=${arg%/*} ;;
+            *) dir=. ;;
+        esac
+        file="$dir/steam_settings/steam_appid.txt"
+        if [ ! -r "$file" ]; then
+            return 0
+        fi
+        appid=$(tr -d '[:space:]' <"$file" 2>/dev/null || true)
+        case "$appid" in
+            '' | *[!0-9]*) return 0 ;;
+        esac
+        if [ "${#appid}" -gt 10 ]; then
+            return 0
+        fi
+        export SteamAppId="$appid" SteamGameId="$appid" SteamOverlayGameId="$appid"
+        if [ "${ARTITUX_DEBUG-}" = 1 ]; then
+            echo "artitux: Steam app ID $appid from $file" >&2
+        fi
+        return 0
+    done
+}
+steam_ids "$@"
+
 export LD_PRELOAD="$lib${filtered:+:$filtered}"
 exec "$@"
 EOF

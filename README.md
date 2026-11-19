@@ -133,7 +133,7 @@ To install a specific release instead of the latest release, set
 `ARTITUX_VERSION`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | ARTITUX_VERSION=v1.0.2 bash
+curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | ARTITUX_VERSION=v1.0.3 bash
 ```
 
 You can also build Artitux from source. See "Build from source" below. The
@@ -203,6 +203,19 @@ When the wrapped command is `gamescope`, the wrapper removes any
 `gameoverlayrenderer.so` entry from the inherited `LD_PRELOAD`. This stops
 Gamescope from loading a Steam overlay that Artitux did not request.
 
+## Steam emulators in releases
+
+Some releases ship a Steam emulator (gbe_fork or Goldberg) with a
+`steam_settings` folder next to the game's `.exe`. When Steam starts such a game
+as a non-Steam shortcut, it sets `SteamAppId` and `SteamGameId` to the
+shortcut's own ID, and the emulator can report that ID to the game. Games that
+check their app ID then close at startup. F1 25 is one of them.
+
+The wrapper prevents this. If the game's `.exe` has a
+`steam_settings/steam_appid.txt` next to it, the wrapper sets `SteamAppId`,
+`SteamGameId`, and `SteamOverlayGameId` to the ID in that file. Other games are
+not affected. To turn this off, set `ARTITUX_STEAM_IDS=0`.
+
 ## Other launchers
 
 - Faugus Launcher: Edit the game and open **Tools > Launch Settings**. Set
@@ -235,6 +248,7 @@ Artitux needs no variables by default. You can set these variables:
 | Variable | Effect |
 | --- | --- |
 | `ARTITUX_DEBUG=1` | Turns on runtime diagnostics |
+| `ARTITUX_STEAM_IDS=0` | Stops the wrapper from setting the Steam app ID from a release's `steam_settings/steam_appid.txt`. See [Steam emulators in releases](#steam-emulators-in-releases) |
 | `ARTITUX_LOG=/absolute/path.log` | Writes diagnostics to a private file with mode `0600` |
 | `PROTON_AVX=1` | Reports AVX in the default CPU presentation. It has no effect with `ARTITUX_LEGACY_PROFILE=1`, which always reports AVX |
 | `ARTITUX_SYSCALL_HACK=1` | Clears Wine's `KUSER_SHARED_DATA.SystemCall` flag, so Wine uses the direct syscall path. Set it only for titles that need it |

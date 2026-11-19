@@ -41,6 +41,7 @@ prefix. If a game already works with LinUwUx, use LinUwUx.
 - Anno 117: Pax Romana v3.0.1
 - Assassin's Creed Black Flag Resynced Title Update 1.0.8
 - F1 25 v1.0.141.7865
+- Crimson Desert
 
 Artitux supports Artifact releases prepared with VBS 1.9, not VBS 2.0.
 

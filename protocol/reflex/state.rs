@@ -1,7 +1,6 @@
 //! The Reflex registration/routing state machine: [`State`] tracks how a
 //! title's Reflex client has registered itself (unregistered, resume-target,
-//! or dual-dispatch — see `docs/protocol/game-quirks.md`'s "handler
-//! arrangement" column) from the control-leaf CPUID sequence in
+//! or dual-dispatch) from the control-leaf CPUID sequence in
 //! [`State::handle_cpuid`], and answers "does a trapped syscall belong to
 //! Reflex, and where does it go" from [`State::route_syscall`].
 //!

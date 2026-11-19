@@ -96,6 +96,12 @@ pub fn visit_writes(vendor: Vendor, mut write: impl FnMut(usize, u8)) -> bool {
     true
 }
 
+/// After registering, the Artifact build that uses the 0x1337 bypass (seen
+/// in Anno 117) polls this KUSER_SHARED_DATA marker and sleeps in 100 ms
+/// waitable-timer waits until it appears. Other builds must not see it.
+pub const READY_MARKER_OFFSET: usize = 0xffc;
+pub const READY_MARKER: u32 = 0x1337_1337;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +213,11 @@ mod tests {
             for range in [0x3d8..0x3e8, 0x3ec..0x600, 0x604..0x804, 0x808..0x818] {
                 assert!(page[range].iter().all(|b| *b == 0));
             }
+            assert!(
+                page[READY_MARKER_OFFSET..READY_MARKER_OFFSET + 4]
+                    .iter()
+                    .all(|b| *b == 0xa5)
+            );
             for range in [
                 0x3c6..0x3c8,
                 0x3e8..0x3ec,

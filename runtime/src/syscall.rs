@@ -1,5 +1,4 @@
-//! Syscall interception, split along the three independent boundaries
-//! `docs/protocol/syscall-routing.md` names: the KUSER dispatcher bridge
+//! Syscall interception includes the KUSER dispatcher bridge
 //! (`kuser_dispatch`) that classifies calls arriving through Wine's KUSER
 //! dispatcher slot, the SIGSYS router (`sigsys_router`) that decides
 //! Wine-vs-Reflex for a trapped syscall, two fixups (`int2e`,

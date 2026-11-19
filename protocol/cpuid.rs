@@ -4,8 +4,8 @@
 //! CPU vendor (detected once, real hardware), whether Proton has AVX enabled
 //! (`PROTON_AVX`), and the [`CpuPresentation`] — modern ("Denuvo") by
 //! default, or [`CpuPresentation::Legacy`] for a title whose Reflex protocol
-//! (see `docs/protocol/game-quirks.md`) or KUSER dispatch recipe needs an
-//! older-looking CPU. [`ActiveCpuIdentity`] holds that identity as a single
+//! or KUSER dispatch recipe needs an older-looking CPU.
+//! [`ActiveCpuIdentity`] holds that identity as a single
 //! atomic so `runtime/src/cpuid.rs`'s SIGSEGV handler can read/update it
 //! without a lock. This file only builds replies and encodes/decodes that
 //! state; it has no idea how a CPUID trap actually reaches it.

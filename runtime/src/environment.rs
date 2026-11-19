@@ -201,7 +201,8 @@ unsafe fn cap_cpu_topology() {
     let cpus = (0..libc::CPU_SETSIZE as usize).filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) });
     let mut topology = [0u8; CPU_TOPOLOGY_CAPACITY];
     if cpu_topology(cpus, &mut topology).is_some() {
-        unsafe { libc::setenv(c"WINE_CPU_TOPOLOGY".as_ptr(), topology.as_ptr().cast(), 0) };
+        // Overwrite: an exported empty value must not keep the cap off.
+        unsafe { libc::setenv(c"WINE_CPU_TOPOLOGY".as_ptr(), topology.as_ptr().cast(), 1) };
     }
 }
 

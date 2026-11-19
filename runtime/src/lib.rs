@@ -2,8 +2,7 @@
 //! that drives the safe `artitux` (`protocol/`) crate's decision logic. Each
 //! module here is feature-gated independently (see the `[features]` table
 //! in `Cargo.toml`) so `xtask` and CI can build and lint every supported
-//! subset; `docs/ARCHITECTURE.md` has the full module map and
-//! `docs/protocol/` has the protocol design each module implements.
+//! subset.
 //! Compiled to a static library and linked into `Artitux.so` by `xtask`,
 //! with the exported C ABI surface and linker hardening it verifies.
 #![deny(unsafe_op_in_unsafe_fn)]

@@ -45,7 +45,8 @@ body:
       description: Include every item listed in the placeholder.
       placeholder: |
         Game and store:
-        Artitux version, release tag, or installed library SHA-256:
+        Artitux version (`artitux --version`):
+        Setup check (`artitux --check`):
         Installation method:
         Launcher and launcher version:
         Proton/Wine name and version:

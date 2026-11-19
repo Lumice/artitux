@@ -1,5 +1,9 @@
 # Artitux
 
+[![Latest release](https://img.shields.io/github/v/release/Lumice/artitux)](https://github.com/Lumice/artitux/releases/latest)
+[![Check](https://github.com/Lumice/artitux/actions/workflows/check.yml/badge.svg)](https://github.com/Lumice/artitux/actions/workflows/check.yml)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+
 Artitux is a Linux compatibility runtime for Windows games that run through
 Wine or Proton. It loads into the game through `LD_PRELOAD`. It keeps these
 parts of the system consistent across the game and its child processes: the CPU
@@ -14,9 +18,36 @@ signal and syscall routing, Gamescope support, and environment handling. It
 adds support for titles that LinUwUx does not cover. If a game already works
 with LinUwUx, use LinUwUx.
 
+## Quick start
+
+1. Install Artitux:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | bash
+   ```
+
+2. Check your system:
+
+   ```sh
+   ~/.local/bin/artitux --check
+   ```
+
+   If a line shows `FAIL`, fix it before you continue. See
+   [CPU and kernel prerequisites](#cpu-and-kernel-prerequisites).
+
+3. In Steam, set the game's launch options to:
+
+   ```text
+   /home/USERNAME/.local/bin/artitux %command%
+   ```
+
+   Replace `USERNAME` with your user name. For other launchers, see
+   [Other launchers](#other-launchers).
+
 ## Confirmed titles
 
-- Planet Zoo 2 v1.0.10 (GE-Proton 11-11)
+- Planet Zoo 2 v1.0.10
+- Anno 117: Pax Romana v3.0.1
 
 Artitux works with Artifact releases prepared with VBS 1.9. It does not work
 with releases prepared with VBS 2.0. Before you report a problem, find out which
@@ -25,7 +56,7 @@ VBS version the release uses.
 ## Requirements
 
 Valve Proton, Proton Experimental, GE-Proton, and UMU-managed builds are
-expected to work. Only GE-Proton 11-11 is confirmed. The host needs:
+expected to work. The host needs:
 
 - x86-64 Linux with glibc 2.34 or newer
 - A 64-bit Wine or Proton host process, or a modern WoW64 setup
@@ -48,6 +79,10 @@ grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(umip|cpuid_fault)$'
 - If the output shows `umip`, UMIP is enabled and you must disable it.
 - If the output shows `cpuid_fault`, the CPU supports CPUID faulting and you do
   not need an emulation module.
+
+After you install Artitux, `artitux --check` does the same check. It also
+reports a loaded `umip_patch` or `cpuid_fault_emulation` module, and whether
+the kernel allows FSGSBASE in user space, which Artifact games also need.
 
 Intel 9th generation CPUs and newer, and AMD Ryzen 3000 CPUs and newer, usually
 need UMIP disabled. AMD Ryzen AM4 CPUs up to the Ryzen 5000 series and the Steam
@@ -98,7 +133,7 @@ To install a specific release instead of the latest release, set
 `ARTITUX_VERSION`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | ARTITUX_VERSION=v1.0.0 bash
+curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | ARTITUX_VERSION=v1.0.1 bash
 ```
 
 You can also build Artitux from source. See "Build from source" below. The
@@ -217,11 +252,23 @@ then uses only the first 16 CPUs that the game can run on, for example
 `16:0,1,2,…,15`. Artifact reports at most 16 processors, and Wine must use the
 same count. If the counts are different, Wine's random-number calls fail and
 some games stop at startup. For example, Planet Zoo 2 shows
-`DStorageGetFactory: 0x80004001`. If you set `WINE_CPU_TOPOLOGY` yourself,
-Artitux uses your value.
+`DStorageGetFactory: 0x80004001`. If you set `WINE_CPU_TOPOLOGY` to a value
+that is not empty, Artitux uses your value.
+
+## Known issues
+
+- Artifact releases prepared with VBS 2.0 do not work. See
+  [Confirmed titles](#confirmed-titles).
+- `clearcpuid=514` is not tested with Artitux yet. See
+  [Disable UMIP](#disable-umip).
+- If the game can run on more than 16 CPU threads, Wine uses only 16 of
+  them. See [Configuration](#configuration).
+- Native 32-bit Wine processes cannot load the library.
 
 ## Troubleshooting
 
+- Run `~/.local/bin/artitux --check` first. It reports the most common setup
+  problems.
 - `artitux: command not found`: Use the wrapper's full path, or add
   `~/.local/bin` to `PATH`.
 - The game does not start: Try `/home/USERNAME/.local/bin/artitux %command%`
@@ -238,7 +285,8 @@ ARTITUX_DEBUG=1 ARTITUX_LOG=/tmp/artitux.log /home/USERNAME/.local/bin/artitux %
 After you collect the log, remove the debug variables. To report a problem,
 open a
 [bug report](https://github.com/Lumice/artitux/issues/new?template=bug_report.yml).
-Attach the full Artitux log and the Proton, UMU, or launcher log. Before you
+Include the output of `~/.local/bin/artitux --version` and `--check`. Attach the
+full Artitux log and the Proton, UMU, or launcher log. Before you
 open a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md). Report security
 issues privately, as [SECURITY.md](SECURITY.md) describes.
 

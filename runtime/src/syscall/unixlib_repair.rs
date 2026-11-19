@@ -474,23 +474,40 @@ mod tests {
         length: usize,
     }
 
+    const GUARD: usize = 0x1000;
+
     impl FakePeExport {
         fn new(name: &[u8], hooked: bool) -> Self {
             Self::with_length(name, hooked, 0x1000)
         }
 
         fn with_length(name: &[u8], hooked: bool, length: usize) -> Self {
-            let base = unsafe {
+            // An inaccessible guard page below the image keeps a parallel
+            // test's anonymous read-write mapping from merging into it: the
+            // clone repair requires a mapping that starts at the image base.
+            let reservation = unsafe {
                 libc::mmap(
                     core::ptr::null_mut(),
-                    length,
-                    libc::PROT_READ | libc::PROT_WRITE,
+                    length + GUARD,
+                    libc::PROT_NONE,
                     libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                     -1,
                     0,
                 )
-            } as u64;
-            assert_ne!(base, u64::MAX, "mmap failed");
+            };
+            assert_ne!(reservation, libc::MAP_FAILED, "mmap failed");
+            let base = reservation as u64 + GUARD as u64;
+            assert_eq!(
+                unsafe {
+                    libc::mprotect(
+                        base as *mut libc::c_void,
+                        length,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    )
+                },
+                0,
+                "mprotect failed"
+            );
             let write = |offset: usize, bytes: &[u8]| unsafe {
                 core::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
@@ -537,7 +554,8 @@ mod tests {
 
     impl Drop for FakePeExport {
         fn drop(&mut self) {
-            unsafe { libc::munmap(self.base as *mut libc::c_void, self.length) };
+            let reservation = (self.base - GUARD as u64) as *mut libc::c_void;
+            unsafe { libc::munmap(reservation, self.length + GUARD) };
         }
     }
 

@@ -399,7 +399,16 @@ unsafe extern "win64" fn after_entry() {
         &data.nodes[1][..data.lens[1]],
         &data.nodes[2][..data.lens[2]],
     ];
-    if !plausible_ldr(public) || !unsafe { adopt_heads(canonical, public, &expected) } {
+    if !plausible_ldr(public) {
+        fatal(b"artitux: Artifact loader data is not plausible after entry\n");
+    }
+    if public == canonical {
+        // Some Artifact builds (seen in Anno 117) keep Wine's PEB_LDR_DATA.
+        note(c"Artifact kept Wine loader data");
+        if !unsafe { relink_in_place(public, &expected) } {
+            fatal(b"artitux: Artifact in-place loader links could not be repaired\n");
+        }
+    } else if !unsafe { adopt_heads(canonical, public, &expected) } {
         fatal(b"artitux: Artifact loader data could not be adopted\n");
     }
     tag_public_only_entries(public, &expected);
@@ -742,6 +751,69 @@ fn plan_head(old: usize, copy: usize, wine_nodes: &[usize]) -> Option<Repair> {
     None
 }
 
+/// Artifact builds that keep Wine's PEB_LDR_DATA splice their private
+/// entries into Wine's lists through Flink only: an inserted node's Blink
+/// points at its successor, and the successor's Blink still skips it. Keep
+/// Artifact's forward order and make every Blink reciprocal. All three lists
+/// are validated, and every target test-written, before the first real write.
+unsafe fn relink_in_place(ldr: usize, expected: &[&[usize]; 3]) -> bool {
+    for (head, wine_nodes) in HEADS.iter().zip(expected.iter()) {
+        if !relink_pass(ldr + head, wine_nodes, false) {
+            note_count(c"Artifact in-place loader head rejected at offset ", *head);
+            return false;
+        }
+    }
+    HEADS
+        .iter()
+        .zip(expected.iter())
+        .all(|(head, wine_nodes)| relink_pass(ldr + head, wine_nodes, true))
+}
+
+/// Walk one list by Flink. It must return to `head` and contain every
+/// snapshotted Wine node in order. Without `commit`, each Blink that needs a
+/// change is only test-written with its current value.
+fn relink_pass(head: usize, wine_nodes: &[usize], commit: bool) -> bool {
+    if !valid_node(head) {
+        return false;
+    }
+    let mut prev = head;
+    let Some(mut cur) = peek(head) else {
+        return false;
+    };
+    let mut matched = 0usize;
+    for _ in 0..MAX_LIST_NODES {
+        if cur == head {
+            return matched == wine_nodes.len() && fix_blink(head, prev, commit);
+        }
+        if !valid_node(cur) {
+            return false;
+        }
+        if wine_nodes.get(matched) == Some(&cur) {
+            matched += 1;
+        }
+        if !fix_blink(cur, prev, commit) {
+            return false;
+        }
+        prev = cur;
+        let Some(next) = peek(cur) else {
+            return false;
+        };
+        cur = next;
+    }
+    false
+}
+
+fn fix_blink(node: usize, prev: usize, commit: bool) -> bool {
+    let Some(current) = peek(node + 8) else {
+        return false;
+    };
+    if current == prev {
+        return true;
+    }
+    let value = if commit { prev } else { current };
+    self_write(node + 8, &value.to_le_bytes())
+}
+
 /// The (address, value) writes one repair needs.
 fn repair_writes(copy: usize, repair: Repair) -> ([(usize, usize); 2], usize) {
     match repair {
@@ -760,6 +832,7 @@ unsafe fn adopt_heads(canonical: usize, public: usize, expected: &[&[usize]; 3])
     let mut count = 0;
     for (head, wine_nodes) in HEADS.iter().zip(expected.iter()) {
         let Some(repair) = plan_head(canonical + head, public + head, wine_nodes) else {
+            note_count(c"Artifact loader head rejected at offset ", *head);
             return false;
         };
         let (pairs, used) = repair_writes(public + head, repair);
@@ -1204,5 +1277,50 @@ mod tests {
             None
         );
         unsafe { libc::munmap(pages, 0x2000) };
+    }
+
+    #[test]
+    fn in_place_flink_only_splice_gets_reciprocal_blinks() {
+        let mut m = Mem::new();
+        let (head, exe, a1, ntdll, a2, k32) = (
+            m.addr(0),
+            m.addr(2),
+            m.addr(4),
+            m.addr(6),
+            m.addr(8),
+            m.addr(10),
+        );
+        // Layout seen with Anno 117's Artifact: inserted nodes point Blink
+        // forward, and Wine's nodes keep Blinks that skip them.
+        m.set(0, exe, k32);
+        m.set(2, a1, head);
+        m.set(4, ntdll, ntdll);
+        m.set(6, a2, exe);
+        m.set(8, k32, k32);
+        m.set(10, head, ntdll);
+        let before = m.words.clone();
+        let missing = m.addr(12);
+        assert!(!relink_pass(head, &[exe, ntdll, missing], false));
+        assert!(!relink_pass(head, &[ntdll, exe], false));
+        assert!(relink_pass(head, &[exe, ntdll, k32], false));
+        assert_eq!(m.words, before);
+        assert!(relink_pass(head, &[exe, ntdll, k32], true));
+        let order = [head, exe, a1, ntdll, a2, k32];
+        for (i, node) in order.iter().enumerate() {
+            let next = order[(i + 1) % order.len()];
+            let prev = order[(i + order.len() - 1) % order.len()];
+            assert_eq!(unsafe { read_word(*node) }, next);
+            assert_eq!(unsafe { read_word(node + 8) }, prev);
+        }
+    }
+
+    #[test]
+    fn in_place_relink_rejects_a_list_that_never_returns_to_its_head() {
+        let mut m = Mem::new();
+        let (head, a, b) = (m.addr(0), m.addr(2), m.addr(4));
+        m.set(0, a, b);
+        m.set(2, b, head);
+        m.set(4, a, a);
+        assert!(!relink_pass(head, &[a], false));
     }
 }

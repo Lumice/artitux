@@ -4,9 +4,7 @@
 //! FFI/signal-handling shell that drives this crate through the `Host`
 //! trait pattern (see `reflex::Host`) and calls its pure functions directly
 //! elsewhere (CPUID reply tables, KUSER patch recipes, environment/gamescope
-//! string parsing). See `docs/ARCHITECTURE.md` for how the two crates fit
-//! together, and `docs/protocol/syscall-routing.md` for the protocol this
-//! module implements.
+//! string parsing).
 #![forbid(unsafe_code)]
 #![no_std]
 

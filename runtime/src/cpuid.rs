@@ -842,10 +842,24 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
             dispatch_guard = unsafe { crate::artifact::wine_dispatch_guard() };
         }
         if crate::artifact::detected() {
-            let had_callback = leaf == 0x336933 && crate::artifact::syscall_target().is_some();
-            let action =
-                crate::artifact::cpuid(leaf, control, payload, ACTIVE_IDENTITY.load().vendor());
-            if leaf == 0x336933
+            // The handler can arrive before (0x336933) or be activated by
+            // (0x1337) the registration; record its image either way.
+            let route_leaf = matches!(leaf, 0x336933 | 0x1337);
+            let had_callback = route_leaf && crate::artifact::syscall_target().is_some();
+            // Only Reflex is known to share the handler leaf. Artifact can run
+            // its handshake from private executable memory, so do not require
+            // the artifact.dll image here.
+            let early_handler_allowed = leaf == 0x336933
+                && !crate::artifact::active()
+                && classify_caller(rip as u64) != Some(CallerKind::Reflex64);
+            let action = crate::artifact::cpuid(
+                leaf,
+                control,
+                payload,
+                ACTIVE_IDENTITY.load().vendor(),
+                early_handler_allowed,
+            );
+            if route_leaf
                 && !had_callback
                 && let Some(callback) = crate::artifact::syscall_target()
             {

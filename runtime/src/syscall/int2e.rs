@@ -42,9 +42,7 @@ const TEST_ZERO_SET_FLAGS: u64 = 0x44;
 // mutating the game's own code, the strategy most likely to trip
 // anti-tamper — can't be drowned out of the log by the common, expected
 // rewind case (fires on essentially every syscall in a hack-off session)
-// exhausting a shared budget first. See docs/protocol/topspin-investigation.md
-// for why this matters: correlating exactly how often each strategy fires
-// is the next evidence needed there.
+// exhausting a shared budget first.
 #[cfg(feature = "debug")]
 static REWIND_LOGGED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "debug")]

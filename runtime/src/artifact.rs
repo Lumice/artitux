@@ -1,7 +1,7 @@
 //! ARTIFACT coordination on Artitux's existing signal and dispatcher engine.
 
 use artitux::artifact::{CpuidAction, State};
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 struct SessionCoordinator {
     owner: AtomicI32,
@@ -50,11 +50,20 @@ impl SessionCoordinator {
         self.state.route_syscall().map(|route| route.target)
     }
 
-    fn cpuid(&self, pid: libc::pid_t, leaf: u32, rcx: u64, rdx: u64, ready: bool) -> CpuidAction {
+    fn cpuid(
+        &self,
+        pid: libc::pid_t,
+        leaf: u32,
+        rcx: u64,
+        rdx: u64,
+        ready: bool,
+        early_handler_allowed: bool,
+    ) -> CpuidAction {
         if !self.claim(pid) {
             return CpuidAction::Native;
         }
-        self.state.cpuid(leaf, rcx, rdx, ready)
+        self.state
+            .cpuid_from(leaf, rcx, rdx, ready, early_handler_allowed)
     }
 
     fn after_fork(&self) {
@@ -119,7 +128,60 @@ pub(crate) fn syscall_target() -> Option<u64> {
     SESSION.syscall_target(unsafe { libc::getpid() })
 }
 
-pub(crate) fn cpuid(leaf: u32, rcx: u64, rdx: u64, vendor: artitux::cpuid::Vendor) -> CpuidAction {
+/// The bypass value read from the registered handler's code; 0 until known.
+static HANDLER_BYPASS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether XMM5's low quadword marks a syscall the Artifact handler let
+/// through. Until the handler's own value is known, only the original
+/// `SYSCALL_BYPASS_MAGIC` counts.
+pub(crate) fn is_syscall_bypass(xmm5: u64) -> bool {
+    xmm5 == selected_bypass(HANDLER_BYPASS.load(Ordering::Acquire))
+}
+
+fn selected_bypass(learned: u64) -> u64 {
+    if learned == 0 {
+        artitux::artifact::SYSCALL_BYPASS_MAGIC
+    } else {
+        learned
+    }
+}
+
+/// Record the bypass value the registered handler loads, once.
+fn learn_handler_bypass(pid: libc::pid_t) {
+    if HANDLER_BYPASS.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let Some(target) = SESSION.syscall_target(pid) else {
+        return;
+    };
+    let mut code = [0u8; 0x200];
+    let Some(len) = [code.len(), 0x100, 0x80]
+        .into_iter()
+        .find(|len| crate::resolver::read_slice(target as usize, &mut code[..*len]))
+    else {
+        return;
+    };
+    let Some(value) = artitux::artifact::handler_bypass_magic(&code[..len]) else {
+        return;
+    };
+    if HANDLER_BYPASS
+        .compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        && value == artitux::artifact::SYSCALL_BYPASS_MAGIC_1337
+    {
+        trace_protocol(0x100, c"ART handler uses the 0x1337 bypass");
+    }
+}
+
+/// `early_handler_allowed`: a handler leaf sent before registration may be
+/// kept (the CPUID site is not a known non-Artifact module).
+pub(crate) fn cpuid(
+    leaf: u32,
+    rcx: u64,
+    rdx: u64,
+    vendor: artitux::cpuid::Vendor,
+    early_handler_allowed: bool,
+) -> CpuidAction {
     // Register, handler and readiness are Artifact-only protocol leaves:
     // Artifact is running, so the loader boundary must already be armed.
     if matches!(leaf, 0x1337 | 0x336933 | 0x1338) {
@@ -134,12 +196,27 @@ pub(crate) fn cpuid(leaf: u32, rcx: u64, rdx: u64, vendor: artitux::cpuid::Vendo
     }
     if leaf == 0x336933 {
         trace_protocol(2, c"ART protocol handler observed");
+        if !SESSION.is_active(pid) {
+            trace_protocol(32, c"ART protocol handler arrived before register");
+            if !early_handler_allowed {
+                trace_protocol(128, c"ART protocol early handler ignored");
+            }
+        }
+    }
+    if leaf == 0x1338 {
+        trace_protocol(16, c"ART protocol readiness requested");
     }
     if leaf == 0x1338 && SESSION.is_active(pid) {
         crate::artifact_kuser::apply_profile(vendor);
     }
     let provider_ready = leaf == 0x1338 && crate::artifact_kuser::profile_ready();
-    let action = SESSION.cpuid(pid, leaf, rcx, rdx, provider_ready);
+    if leaf == 0x1338 && !provider_ready {
+        trace_protocol(
+            64,
+            c"ART protocol readiness requested before the provider was ready",
+        );
+    }
+    let action = SESSION.cpuid(pid, leaf, rcx, rdx, provider_ready, early_handler_allowed);
     if action == CpuidAction::Ready {
         trace_protocol(4, c"ART protocol readiness delivered");
     }
@@ -148,6 +225,14 @@ pub(crate) fn cpuid(leaf: u32, rcx: u64, rdx: u64, vendor: artitux::cpuid::Vendo
     }
     if leaf == 0x1337 && SESSION.is_active(pid) {
         crate::artifact_kuser::apply_profile(vendor);
+    }
+    if matches!(leaf, 0x1337 | 0x336933) && SESSION.is_active(pid) {
+        learn_handler_bypass(pid);
+        if HANDLER_BYPASS.load(Ordering::Acquire) == artitux::artifact::SYSCALL_BYPASS_MAGIC_1337
+            && crate::artifact_kuser::publish_ready_marker()
+        {
+            trace_protocol(0x200, c"ART ready marker published");
+        }
     }
     action
 }
@@ -216,6 +301,7 @@ pub(crate) fn after_fork() {
     TRACED_PROTOCOL.store(0, Ordering::Relaxed);
     DETECTED.store(false, Ordering::Release);
     INITIALIZING.store(0, Ordering::Release);
+    HANDLER_BYPASS.store(0, Ordering::Release);
     SESSION.after_fork();
     crate::artifact_kuser::after_fork();
 }
@@ -267,8 +353,8 @@ mod tests {
     fn raw_fork_child_rejects_parent_route_and_registers_a_fresh_session() {
         let session = SessionCoordinator::new();
         let parent = unsafe { libc::getpid() };
-        session.cpuid(parent, 0x1337, 0, 0x174, false);
-        session.cpuid(parent, 0x336933, 0x1111_0000, 0, false);
+        session.cpuid(parent, 0x1337, 0, 0x174, false, false);
+        session.cpuid(parent, 0x336933, 0x1111_0000, 0, false, false);
         assert!(session.is_active(parent));
         assert_eq!(session.syscall_target(parent), Some(0x1111_0000));
 
@@ -278,14 +364,15 @@ mod tests {
             let child_pid = unsafe { libc::getpid() };
             let inherited_rejected =
                 !session.is_active(child_pid) && session.syscall_target(child_pid).is_none();
-            let reset = session.cpuid(child_pid, 0x336967, 0, 0, false) == CpuidAction::Native;
-            session.cpuid(child_pid, 0x1337, 0, 0x180, false);
-            session.cpuid(child_pid, 0x336933, 0x2222_0000, 0, false);
+            let reset =
+                session.cpuid(child_pid, 0x336967, 0, 0, false, false) == CpuidAction::Native;
+            session.cpuid(child_pid, 0x1337, 0, 0x180, false, false);
+            session.cpuid(child_pid, 0x336933, 0x2222_0000, 0, false, false);
             let registered = session.is_active(child_pid)
                 && session.syscall_target(child_pid) == Some(0x2222_0000);
             let ready = crate::artifact_kuser::ready();
-            let no_fake_ready =
-                !ready && session.cpuid(child_pid, 0x1338, 0, 0, ready) == CpuidAction::Native;
+            let no_fake_ready = !ready
+                && session.cpuid(child_pid, 0x1338, 0, 0, ready, false) == CpuidAction::Native;
             unsafe {
                 libc::_exit(
                     if inherited_rejected && reset && registered && no_fake_ready {
@@ -305,5 +392,18 @@ mod tests {
         assert_eq!(libc::WEXITSTATUS(status), 0);
         assert!(session.is_active(parent));
         assert_eq!(session.syscall_target(parent), Some(0x1111_0000));
+    }
+}
+
+#[cfg(test)]
+mod bypass_selection_tests {
+    #[test]
+    fn unknown_handler_keeps_the_original_bypass_value() {
+        assert_eq!(
+            super::selected_bypass(0),
+            artitux::artifact::SYSCALL_BYPASS_MAGIC
+        );
+        let anno = artitux::artifact::SYSCALL_BYPASS_MAGIC_1337;
+        assert_eq!(super::selected_bypass(anno), anno);
     }
 }

@@ -9,14 +9,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 const ADDRESS: usize = 0x7ffe_0000;
 /// `KUSER_SHARED_DATA.SystemCall`: nonzero routes Wine's ntdll syscall
-/// stubs through the KUSER dispatcher slot (the target design — see
-/// `docs/protocol/syscall-routing.md`); the legacy `ARTITUX_SYSCALL_HACK`
-/// path clears it so stubs take the direct `syscall` branch instead. This is
-/// meant to be removed, not extended: it stays only because one supported
-/// title (TopSpin) still crashes without it and the root cause isn't found
-/// yet, tracked in `docs/protocol/topspin-investigation.md`. Do not add new
-/// callers of `syscall_hack_enabled()`; the dispatcher bridge
-/// (`syscall/kuser_dispatch.rs`) is the mechanism new code should rely on.
+/// stubs through the KUSER dispatcher slot. The legacy `ARTITUX_SYSCALL_HACK`
+/// path clears it so stubs take the direct `syscall` branch. TopSpin still
+/// crashes without this legacy path. New code should use the dispatcher
+/// bridge (`syscall/kuser_dispatch.rs`).
 const SYSTEM_CALL_OFFSET: usize = 0x308;
 const SYSCALL_HACK_ENV: &CStr = c"ARTITUX_SYSCALL_HACK";
 static PAGE_GEOMETRY_SUPPORTED: AtomicBool = AtomicBool::new(false);

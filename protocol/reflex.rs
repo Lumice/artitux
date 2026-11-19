@@ -1,10 +1,8 @@
 //! The Reflex CPUID control protocol and syscall routing state machine —
 //! the safe core `runtime/src/reflex.rs` drives through the [`Host`] trait,
 //! and that `runtime/src/syscall/sigsys_router.rs` calls into via
-//! [`State::route_syscall`]. See `docs/protocol/syscall-routing.md` for the
-//! design this implements and `docs/protocol/game-quirks.md` for why
-//! different titles exercise different parts of it (resume-target vs.
-//! dual-dispatch, CR3 vs. DR3/DR7 identity).
+//! [`State::route_syscall`]. Titles can use resume-target or dual-dispatch
+//! routing, with CR3 or DR3/DR7 identity.
 mod control;
 mod state;
 

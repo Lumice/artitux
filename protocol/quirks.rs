@@ -1,38 +1,20 @@
-//! Per-title reference data for the Reflex protocol differences documented
-//! in `docs/protocol/game-quirks.md`. This is *reference* data, not a
-//! dispatch table: Artitux's actual protocol logic (CPU vendor/AVX
-//! detection, KUSER recipe selection, Reflex identity-scope tracking) is
-//! already driven by live CPUID/registration probing — see `cpuid.rs` and
-//! `reflex/state.rs` — not by branching on which title is running. What
-//! this table is for:
+//! Per-title reference data for Reflex protocol behavior. Live CPUID and
+//! registration probes drive Artitux's protocol logic in `cpuid.rs` and
+//! `reflex/state.rs`.
 //!
-//! - a single, compiled (so it can't silently drift from the runtime code
-//!   the way a comment can) place to record which combination of the three
-//!   independent axes below a supported title exercises, for a contributor
-//!   adding a new title to check against;
-//! - naming any constant that genuinely is title-specific, like a debug
-//!   trace's syscall service number, instead of leaving it as an unexplained
-//!   literal in dispatch code.
-//!
-//! `docs/protocol/game-quirks.md`'s "Conclusions" section is the important
-//! caveat: these three axes are related but independent — do not infer one
-//! from another, and do not add code that does.
+//! CPU identity, KUSER recipe, registration scope, and dispatch arrangement
+//! vary independently.
 
-/// The CPU identity family a title's Reflex client presents — see
-/// `docs/protocol/game-quirks.md`'s "CPU identity" table. Selected at
-/// runtime by `protocol::cpuid::CpuPresentation`, not looked up from this
-/// table.
+/// The CPU identity family presented to a title's Reflex client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuIdentityFamily {
-    /// `DenuvOwO` brand string, the default modern presentation.
-    Denuvo,
+    /// The default CPU presentation.
+    Default,
     /// Legacy-CPU brand strings (i9-10900K / Ryzen 9 5900X).
     Modern,
 }
 
-/// Which `KUSER_SHARED_DATA` byte-write recipe a title's Reflex client
-/// expects — see `docs/protocol/game-quirks.md`'s "KUSER_SHARED_DATA
-/// recipes" table and `protocol::kuser::Recipe`.
+/// The [`crate::kuser::Recipe`] family a title's Reflex client expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KuserRecipeFamily {
     Resume,
@@ -55,7 +37,7 @@ pub enum DispatchArrangement {
     DualDispatch,
 }
 
-/// One row of `docs/protocol/game-quirks.md`'s tables.
+/// The Reflex protocol behavior observed for one title.
 #[derive(Debug, Clone, Copy)]
 pub struct Title {
     pub name: &'static str,
@@ -68,45 +50,42 @@ pub struct Title {
 pub const TITLES: &[Title] = &[
     Title {
         name: "ACBFR",
-        cpu_identity: CpuIdentityFamily::Denuvo,
+        cpu_identity: CpuIdentityFamily::Default,
         kuser_recipe: KuserRecipeFamily::Resume,
         identity_scope: ReflexIdentityScope::DebugRegister,
         dispatch: DispatchArrangement::SingleResumeTarget,
     },
     Title {
         name: "BGE",
-        cpu_identity: CpuIdentityFamily::Denuvo,
+        cpu_identity: CpuIdentityFamily::Default,
         kuser_recipe: KuserRecipeFamily::Resume,
         identity_scope: ReflexIdentityScope::Cr3,
         dispatch: DispatchArrangement::SingleResumeTarget,
     },
     Title {
         name: "FC6",
-        cpu_identity: CpuIdentityFamily::Denuvo,
+        cpu_identity: CpuIdentityFamily::Default,
         kuser_recipe: KuserRecipeFamily::Resume,
         identity_scope: ReflexIdentityScope::Cr3,
         dispatch: DispatchArrangement::SingleResumeTarget,
     },
     Title {
         name: "NFSPB",
-        cpu_identity: CpuIdentityFamily::Denuvo,
+        cpu_identity: CpuIdentityFamily::Default,
         kuser_recipe: KuserRecipeFamily::Resume,
         identity_scope: ReflexIdentityScope::DebugRegister,
         dispatch: DispatchArrangement::SingleResumeTarget,
     },
     Title {
         name: "TopSpin",
-        cpu_identity: CpuIdentityFamily::Denuvo,
+        cpu_identity: CpuIdentityFamily::Default,
         kuser_recipe: KuserRecipeFamily::Resume,
         identity_scope: ReflexIdentityScope::Cr3,
         dispatch: DispatchArrangement::SingleResumeTarget,
     },
     Title {
         name: "SMT5V",
-        // The counterexample docs/protocol/game-quirks.md's Conclusions
-        // section calls out: modern CPU identity and dispatch-family KUSER
-        // lineage, but a ResumeTarget-only handshake. Do not "simplify" this
-        // row to match the other Modern-identity titles.
+        // SMT5V pairs the dispatch recipe with a single resume target.
         cpu_identity: CpuIdentityFamily::Modern,
         kuser_recipe: KuserRecipeFamily::Dispatch,
         identity_scope: ReflexIdentityScope::Cr3,

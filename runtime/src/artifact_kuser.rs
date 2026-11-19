@@ -632,6 +632,27 @@ pub(crate) fn apply_profile(vendor: Vendor) -> bool {
     applied
 }
 
+/// Write the ready marker the 0x1337-bypass Artifact build polls for. Only
+/// after this process published its profile into its own backing.
+pub(crate) fn publish_ready_marker() -> bool {
+    if !profile_ready() {
+        return false;
+    }
+    let destination = WRITABLE_ALIAS.load(Ordering::Acquire);
+    if destination.is_null() {
+        return false;
+    }
+    let offset = artitux::artifact_profile::READY_MARKER_OFFSET;
+    for (i, byte) in artitux::artifact_profile::READY_MARKER
+        .to_le_bytes()
+        .into_iter()
+        .enumerate()
+    {
+        unsafe { &*destination.add(offset + i).cast::<AtomicU8>() }.store(byte, Ordering::Release);
+    }
+    true
+}
+
 /// An inherited or still-publishing profile cannot satisfy ART readiness.
 pub(crate) fn profile_ready() -> bool {
     let pid = unsafe { libc::getpid() };

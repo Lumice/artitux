@@ -6,12 +6,11 @@
 //! variable and deciding whether the current process is a game process.
 use core::ffi::CStr;
 
-pub const OVERRIDES: [&CStr; 16] = [
+pub const OVERRIDES: [&CStr; 15] = [
     c"winmm",
     c"version",
     c"reflex",
     c"reflex64",
-    c"DenuvOwO",
     c"artifact",
     c"d3d9",
     c"d3d10",

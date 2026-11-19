@@ -264,8 +264,8 @@ unsafe fn redirect(
         && let Some(target) = artifact_target
     {
         let rsp = unsafe { gregs.add(libc::REG_RSP as usize).read() as u64 };
-        let bypass = u64::from_le_bytes(xmm5[..8].try_into().unwrap())
-            == artitux::artifact::SYSCALL_BYPASS_MAGIC;
+        let bypass =
+            crate::artifact::is_syscall_bypass(u64::from_le_bytes(xmm5[..8].try_into().unwrap()));
         let service = unsafe { gregs.add(libc::REG_RAX as usize).read() as u32 };
         let mut xmm4 = [0u8; 16];
         xmm4[..4].copy_from_slice(&service.to_le_bytes());
@@ -470,8 +470,8 @@ unsafe fn redirect(
         // hooked-syscall entry point — reverse-engineered to expect exactly
         // what `int 2e` would hand it — needs that true value here, on the
         // way in, not only restored on the bridged marker's `Phase::Replay`
-        // return trip above. See syscall-routing.md's "preserve ...
-        // R11/EFLAGS" invariant: it applies to both hops, not just one.
+        // return trip above. R11/EFLAGS must be preserved on both hops,
+        // not just one.
         let r11 = gregs.add(libc::REG_R11 as usize).read();
         gregs.add(libc::REG_EFL as usize).write(r11);
 

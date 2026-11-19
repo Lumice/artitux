@@ -46,14 +46,23 @@ if [ "$(printf '%s.' "$LIB_PATH" | tr -d ':[:space:]')" != "${LIB_PATH}." ]; the
 fi
 
 if [ "$VERSION" = "latest" ]; then
-    asset_url="https://github.com/$REPO/releases/latest/download/Artitux.so"
-else
-    asset_url="https://github.com/$REPO/releases/download/$VERSION/Artitux.so"
+    latest_url="$(curl -fsS -o /dev/null -w '%{redirect_url}' "https://github.com/$REPO/releases/latest")"
+    case "$latest_url" in
+        "https://github.com/$REPO/releases/tag/"*) VERSION="${latest_url##*/}" ;;
+        *) VERSION= ;;
+    esac
 fi
+case "$VERSION" in
+    ""|*[!A-Za-z0-9._-]*)
+        echo "install.sh: could not determine the release to install (got '$VERSION')" >&2
+        exit 1
+        ;;
+esac
+asset_url="https://github.com/$REPO/releases/download/$VERSION/Artitux.so"
 
 tmp_lib="$(mktemp)"
 tmp_bin=
-trap 'rm -f "$tmp_lib" ${tmp_bin:+"$tmp_bin"}' EXIT
+trap 'rm -f "$tmp_lib" "$LIB_PATH.new" ${tmp_bin:+"$tmp_bin"}' EXIT
 
 echo "artitux: downloading Artitux.so ($VERSION) from $REPO"
 curl -fsSL "$asset_url" -o "$tmp_lib"
@@ -65,8 +74,6 @@ if [ "$magic" != "7f454c46" ]; then
 fi
 
 mkdir -p "$LIB_DIR" "$BIN_DIR"
-install -m 0644 "$tmp_lib" "$LIB_PATH"
-
 tmp_bin="$(mktemp "$BIN_DIR/.artitux.XXXXXX")"
 escaped_lib="$(printf '%s' "$LIB_PATH" | sed "s/'/'\\\\''/g")"
 {
@@ -77,7 +84,105 @@ set -f
 
 EOF
     printf "lib='%s'\n" "$escaped_lib"
+    printf "version='%s'\n" "$VERSION"
     cat <<'EOF'
+
+check() {
+    failed=0
+    flags="$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)"
+    if [ -n "$flags" ]; then flags=" ${flags#*:} "; fi
+    report() {
+        printf '  %-12s %-5s %s\n' "$1" "$2" "$3"
+        if [ "$2" = FAIL ]; then failed=1; fi
+    }
+    has_flag() {
+        case "$flags" in *" $1 "*) return 0 ;; esac
+        return 1
+    }
+
+    echo "artitux $version"
+    if [ -r "$lib" ]; then
+        report library ok "$lib"
+    else
+        report library FAIL "not found: $lib (reinstall with install.sh)"
+    fi
+
+    if [ -z "$flags" ]; then
+        report UMIP unknown "cannot read the CPU flags from /proc/cpuinfo"
+    elif ! has_flag umip; then
+        report UMIP ok "disabled"
+    elif [ -d /sys/module/umip_patch ]; then
+        report UMIP ok "enabled, but the umip_patch module is loaded"
+    else
+        report UMIP FAIL "enabled (see \"Disable UMIP\" in the README)"
+    fi
+
+    if [ -z "$flags" ]; then
+        report CPUID unknown "cannot read the CPU flags from /proc/cpuinfo"
+    elif has_flag cpuid_fault; then
+        report CPUID ok "CPUID faulting is supported"
+    elif [ -d /sys/module/cpuid_fault_emulation ]; then
+        report CPUID ok "CPUID faulting comes from the cpuid_fault_emulation module"
+    else
+        report CPUID FAIL "CPUID faulting is not available (see \"CPUID faulting on AMD\" in the README)"
+    fi
+
+    # Artifact games need the kernel to allow FSGSBASE in user space
+    # (AT_HWCAP2 bit 1), the same test the library makes.
+    hwcap2="$(LD_SHOW_AUXV=1 /bin/true 2>/dev/null | sed -n 's/^AT_HWCAP2: *//p')"
+    case "$hwcap2" in
+        0x*[!0-9a-fA-F]*|"") report FSGSBASE unknown "cannot read AT_HWCAP2" ;;
+        0x*)
+            if [ $((hwcap2 & 2)) -ne 0 ]; then
+                report FSGSBASE ok "enabled for user space"
+            else
+                report FSGSBASE FAIL "not enabled for user space (check for nofsgsbase on the kernel command line)"
+            fi
+            ;;
+        *) report FSGSBASE unknown "cannot read AT_HWCAP2" ;;
+    esac
+
+    # Count the CPUs this process may run on, as the library does.
+    cpus=unknown
+    allowed="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status 2>/dev/null || true)"
+    if [ -n "$allowed" ]; then
+        cpus=0
+        old_ifs=$IFS
+        IFS=,
+        for range in $allowed; do
+            case "$range" in
+                *-*) cpus=$((cpus + ${range#*-} - ${range%-*} + 1)) ;;
+                *) cpus=$((cpus + 1)) ;;
+            esac
+        done
+        IFS=$old_ifs
+    fi
+    if [ -n "${WINE_CPU_TOPOLOGY-}" ]; then
+        report CPUs info "$cpus available; WINE_CPU_TOPOLOGY is set, so Artitux uses that value"
+    elif [ "$cpus" != unknown ] && [ "$cpus" -gt 16 ]; then
+        report CPUs info "$cpus available; Artitux limits Wine to the first 16"
+    else
+        report CPUs ok "$cpus available"
+    fi
+
+    return "$failed"
+}
+
+case "${1-}" in
+    --version|--check)
+        if [ "$#" -ne 1 ]; then
+            echo "artitux: $1 does not accept additional arguments" >&2
+            exit 2
+        fi
+        if [ "$1" = --version ]; then
+            echo "artitux $version"
+            echo "library: $lib"
+            exit 0
+        fi
+        check && exit 0
+        exit 1
+        ;;
+esac
 
 if [ ! -r "$lib" ]; then
     echo "artitux: library not found: $lib" >&2
@@ -126,6 +231,12 @@ exec "$@"
 EOF
 } >"$tmp_bin"
 chmod 0755 "$tmp_bin"
+
+# Replace the library and the launcher back to back, each with a rename, so
+# an interrupted upgrade does not leave a launcher reporting another release.
+chmod 0644 "$tmp_lib"
+mv -f "$tmp_lib" "$LIB_PATH.new"
+mv -f "$LIB_PATH.new" "$LIB_PATH"
 mv -f "$tmp_bin" "$BIN_PATH"
 tmp_bin=
 
@@ -144,6 +255,10 @@ echo "artitux: installed launcher to $BIN_PATH"
 if [ "$INSTALL_GLOBAL" -eq 1 ]; then
     echo "artitux: global launcher installed to $GLOBAL_BIN_PATH"
 fi
+
+echo
+echo "To check your system, run:"
+echo "  $BIN_PATH --check"
 
 echo
 echo "Set your game's launch command to:"

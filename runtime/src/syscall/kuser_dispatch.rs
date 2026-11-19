@@ -8,8 +8,7 @@
 //! the source contract's service/XMM normalization. Protocol semantics are
 //! handled afterward at the [`super::sigsys_router`] boundary.
 //!
-//! See `docs/protocol/syscall-routing.md` for how this fits into the overall
-//! design, and [`should_replay_raw`] for the actual classification rule.
+//! See [`should_replay_raw`] for the classification rule.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -600,7 +599,7 @@ unsafe fn dispatcher_target_for_frame(
     xmm5: u64,
     frame: &mut DispatcherFrame,
 ) -> u64 {
-    if artifact && original != 0 && xmm5 == artitux::artifact::SYSCALL_BYPASS_MAGIC {
+    if artifact && original != 0 && crate::artifact::is_syscall_bypass(xmm5) {
         // The source contract applies before canonical-stub decoding: even
         // noncanonical callers carry a real service in EAX. Leave their
         // continuation, flags, arguments and nonvolatile state untouched.
@@ -632,10 +631,8 @@ static mut BRIDGE_STACKS: BridgeStacks =
 /// Wine's KUSER dispatcher slot trampoline. Saves every register a Windows
 /// syscall stub's caller could observe, runs [`dispatcher_target`] on a
 /// private per-thread stack (see the field comment on `BRIDGE_STACKS`), and
-/// restores everything before jumping to the chosen target. Reviewed as its
-/// own pass in Stage 6 of the syscall redesign plan; see
-/// `docs/protocol/syscall-routing.md` invariant 4 for the ABI parity this
-/// must hold on the direct-replay path.
+/// restores everything before jumping to the chosen target, preserving ABI
+/// parity on the direct-replay path.
 #[cfg(feature = "kuser")]
 #[unsafe(naked)]
 unsafe extern "C" fn dispatcher_bridge() {
@@ -676,8 +673,8 @@ unsafe extern "C" fn dispatcher_bridge() {
         "push qword ptr [rsp + 0x78]", "popfq",
         "movdqu xmm0, [rsp + 0x80]", "movdqu xmm1, [rsp + 0x90]", "movdqu xmm2, [rsp + 0xa0]", "movdqu xmm3, [rsp + 0xb0]", "movdqu xmm4, [rsp + 0xc0]", "movdqu xmm5, [rsp + 0xd0]", "movdqu xmm6, [rsp + 0xe0]", "movdqu xmm7, [rsp + 0xf0]", "movdqu xmm8, [rsp + 0x100]", "movdqu xmm9, [rsp + 0x110]", "movdqu xmm10, [rsp + 0x120]", "movdqu xmm11, [rsp + 0x130]", "movdqu xmm12, [rsp + 0x140]", "movdqu xmm13, [rsp + 0x150]", "movdqu xmm14, [rsp + 0x160]", "movdqu xmm15, [rsp + 0x170]",
         // The two exits below land rsp one word apart (0x190 vs. 0x188) on
-        // purpose — this is syscall-routing.md invariant 4's "account for
-        // the KUSER call's extra stack word". `[rsp+0x188]` here is
+        // purpose, to account for the KUSER call's extra stack word.
+        // `[rsp+0x188]` here is
         // `entry_rsp`: the value RSP held at the moment this trampoline was
         // entered, which is where the ntdll stub's own `call
         // [dispatcher_slot]` pushed its return address (call it
@@ -1178,8 +1175,8 @@ mod tests {
         );
         crate::artifact::mark_detected();
         crate::artifact_loader::arm_for_test();
-        crate::artifact::cpuid(0x1337, 0, 1, artitux::cpuid::Vendor::Amd);
-        crate::artifact::cpuid(0x336933, 0x1234_0000, 0, artitux::cpuid::Vendor::Amd);
+        crate::artifact::cpuid(0x1337, 0, 1, artitux::cpuid::Vendor::Amd, false);
+        crate::artifact::cpuid(0x336933, 0x1234_0000, 0, artitux::cpuid::Vendor::Amd, false);
         assert!(crate::artifact::active());
         assert_eq!(crate::artifact::syscall_target(), Some(0x1234_0000));
         super::ORIGINAL_DISPATCHER.store(

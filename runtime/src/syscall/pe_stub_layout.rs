@@ -328,6 +328,10 @@ pub unsafe extern "C" fn mmap(
             core::mem::transmute::<*mut c_void, Mmap>(real)(addr, length, prot, flags, fd, offset)
         }
     };
+    #[cfg(feature = "artifact")]
+    if result != libc::MAP_FAILED {
+        crate::cpuid::note_mapping(result as u64, length as u64);
+    }
     if result != libc::MAP_FAILED && fd >= 0 && flags & libc::MAP_ANONYMOUS == 0 {
         #[cfg(feature = "cpuid")]
         crate::maps::note_file_mapping();

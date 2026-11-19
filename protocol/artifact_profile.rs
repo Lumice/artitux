@@ -52,6 +52,49 @@ pub fn native_wine_view(address: u64, path: Option<&[u8]>) -> bool {
     crate::cpuid::is_wine_system_rip(address)
 }
 
+/// End of a valid PE64 image mapped at `base`, checked as [`pe_image_contains`]
+/// checks it.
+pub fn pe_image_end(base: u64, dos: &[u8], pe: &[u8]) -> Option<u64> {
+    pe_image_contains(base, base, dos, pe)
+        .then(|| base + u64::from(u32::from_le_bytes([pe[80], pe[81], pe[82], pe[83]])))
+}
+
+/// The addresses around `address` that get the same Wine-view answer as
+/// `address`, so one answer can be reused for all of them.
+///
+/// `mapping` is the `/proc/self/maps` entry containing `address`. For
+/// anonymous code, the answer comes from the closest preceding PE image that
+/// contains the address: `image_end` is that image's end, and
+/// `closer_image_end` is the largest end of any closer image that does not
+/// contain `address` (such an image would win below its end). The fallback,
+/// [`crate::cpuid::is_wine_system_rip`], changes only at the Wine system range
+/// bounds, so the range never crosses them.
+pub fn constant_wine_view_range(
+    address: u64,
+    mapping: (u64, u64),
+    anonymous: bool,
+    image_end: Option<u64>,
+    closer_image_end: u64,
+) -> Option<(u64, u64)> {
+    let (mut start, mut end) = mapping;
+    if anonymous {
+        if let Some(image_end) = image_end {
+            end = end.min(image_end);
+        }
+        start = start.max(closer_image_end);
+    }
+    let (wine_start, wine_end) = crate::cpuid::wine_system_rip_range();
+    if address < wine_start {
+        end = end.min(wine_start);
+    } else if address < wine_end {
+        start = start.max(wine_start);
+        end = end.min(wine_end);
+    } else {
+        start = start.max(wine_end);
+    }
+    (start..end).contains(&address).then_some((start, end))
+}
+
 /// CPUID reply for an Artifact query: hypervisor identity and brand leaves,
 /// XSAVE/AVX bits masked in leaf 1, a zeroed high-leaf range, and native
 /// words for everything else.
@@ -299,5 +342,57 @@ mod tests {
             reply(Vendor::Amd, pentium, 1, 0, native),
             reply(Vendor::Amd, IntelIdentity::Core, 1, 0, native)
         );
+    }
+
+    #[test]
+    fn wine_view_range_follows_the_mapping_image_and_wine_bounds() {
+        let (wine_start, wine_end) = crate::cpuid::wine_system_rip_range();
+        // A file-backed game mapping below the Wine range: the whole mapping.
+        let game = (0x1_4000_1000, 0x1_4520_0000);
+        assert_eq!(
+            constant_wine_view_range(0x1_4500_3dc3, game, false, None, 0),
+            Some(game)
+        );
+        // Anonymous code is cut to its image and past closer, non-containing images.
+        assert_eq!(
+            constant_wine_view_range(0x5000, (0x1000, 0x9000), true, Some(0x7000), 0x3000),
+            Some((0x3000, 0x7000))
+        );
+        // A closer image ending past the address leaves nothing to cache.
+        assert_eq!(
+            constant_wine_view_range(0x5000, (0x1000, 0x9000), true, Some(0x7000), 0x6000),
+            None
+        );
+        // Mappings that straddle the Wine range bounds are cut at them.
+        let straddle = (wine_start - 0x1000, wine_start + 0x1000);
+        assert_eq!(
+            constant_wine_view_range(wine_start - 0x10, straddle, false, None, 0),
+            Some((wine_start - 0x1000, wine_start))
+        );
+        assert_eq!(
+            constant_wine_view_range(wine_start + 0x10, straddle, false, None, 0),
+            Some((wine_start, wine_start + 0x1000))
+        );
+        let above = (wine_end - 0x1000, wine_end + 0x1000);
+        assert_eq!(
+            constant_wine_view_range(wine_end + 0x10, above, false, None, 0),
+            Some((wine_end, wine_end + 0x1000))
+        );
+    }
+
+    #[test]
+    fn pe_image_end_requires_a_valid_image() {
+        let base = 0x6fff_ff6d_0000;
+        let mut dos = [0u8; 64];
+        dos[..2].copy_from_slice(b"MZ");
+        dos[0x3c..].copy_from_slice(&0x80u32.to_le_bytes());
+        let mut pe = [0u8; 84];
+        pe[..4].copy_from_slice(b"PE\0\0");
+        pe[4..6].copy_from_slice(&0x8664u16.to_le_bytes());
+        pe[24..26].copy_from_slice(&0x20bu16.to_le_bytes());
+        pe[80..84].copy_from_slice(&0x22000u32.to_le_bytes());
+        assert_eq!(pe_image_end(base, &dos, &pe), Some(base + 0x22000));
+        pe[4..6].copy_from_slice(&0x14cu16.to_le_bytes());
+        assert_eq!(pe_image_end(base, &dos, &pe), None);
     }
 }

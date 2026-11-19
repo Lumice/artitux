@@ -287,6 +287,11 @@ pub fn is_wine_system_rip(address: u64) -> bool {
     (WINE_SYSTEM_RIP_MIN..WINE_SYSTEM_RIP_MAX).contains(&address)
 }
 
+/// The address range [`is_wine_system_rip`] accepts.
+pub const fn wine_system_rip_range() -> (u64, u64) {
+    (WINE_SYSTEM_RIP_MIN, WINE_SYSTEM_RIP_MAX)
+}
+
 #[derive(Debug)]
 pub struct ActiveCpuIdentity {
     raw_identity: AtomicU32,

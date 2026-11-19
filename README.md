@@ -42,6 +42,7 @@ prefix. If a game already works with LinUwUx, use LinUwUx.
 - Assassin's Creed Black Flag Resynced Title Update 1.0.8
 - F1 25 v1.0.141.7865
 - Crimson Desert
+- Stellar Blade
 
 Artitux supports Artifact releases prepared with VBS 1.9, not VBS 2.0.
 
@@ -90,7 +91,7 @@ curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | ba
 To install a specific release, set `ARTITUX_VERSION`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | ARTITUX_VERSION=v1.0.3 bash
+curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | ARTITUX_VERSION=v1.0.4 bash
 ```
 
 The installer writes these files and needs no root access:

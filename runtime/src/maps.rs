@@ -148,7 +148,7 @@ static FILE_MAPPINGS: AtomicU64 = AtomicU64::new(0);
 ))]
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn note_file_mapping() {
-    FILE_MAPPINGS.fetch_add(1, Ordering::Relaxed);
+    FILE_MAPPINGS.fetch_add(1, Ordering::Release);
 }
 
 #[cfg(all(
@@ -158,7 +158,7 @@ pub(crate) fn note_file_mapping() {
     feature = "environment"
 ))]
 pub(crate) fn file_mapping_generation() -> u64 {
-    FILE_MAPPINGS.load(Ordering::Relaxed)
+    FILE_MAPPINGS.load(Ordering::Acquire)
 }
 
 #[cfg(test)]

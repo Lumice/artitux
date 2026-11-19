@@ -134,6 +134,22 @@ impl CallerCache {
     }
 }
 
+impl CallerCache {
+    /// After `fork`, only this thread exists: an entry another thread was
+    /// writing (odd sequence) is emptied and made readable again.
+    fn reset_after_fork(&self) {
+        for index in 0..CALLER_CACHE_CAP {
+            let sequence = self.sequences[index].load(Ordering::Relaxed);
+            if sequence & 1 != 0 {
+                self.starts[index].store(0, Ordering::Relaxed);
+                self.ends[index].store(0, Ordering::Relaxed);
+                self.sequences[index].store(sequence.wrapping_add(1), Ordering::Release);
+            }
+        }
+        self.lock.store(false, Ordering::Release);
+    }
+}
+
 static CALLER_CACHE: CallerCache = CallerCache::new();
 
 unsafe extern "C" {
@@ -417,8 +433,10 @@ static NATIVE_CACHE: NativeCache = NativeCache::new();
 
 #[cfg_attr(not(feature = "hooks"), allow(dead_code))]
 pub(crate) fn after_fork() {
-    CALLER_CACHE.lock.store(false, Ordering::Release);
+    CALLER_CACHE.reset_after_fork();
     NATIVE_CACHE.lock.store(false, Ordering::Release);
+    #[cfg(feature = "artifact")]
+    WINE_VIEW_CACHE.reset_after_fork();
 }
 
 fn artifact_reply(vendor: Vendor, leaf: u32) -> Option<Registers> {
@@ -680,9 +698,169 @@ enum CpuidOutput {
 }
 
 #[cfg(feature = "artifact")]
+const WINE_VIEW_CACHE_CAP: usize = 64;
+
+/// Address ranges whose Wine-view answer is already known, so a repeat CPUID
+/// from the same code skips the `/proc/self/maps` scan. Without this, every
+/// Artifact-game CPUID costs a full scan, which widens game-side
+/// set-flag-then-fill races (Stellar Blade's SIMD table setup) into crashes.
+/// Each entry records the file-mapping generation it was computed under and
+/// is ignored once a new file mapping appears. Entries use the same seqlock
+/// and skip-if-busy insert as [`CallerCache`].
+#[cfg(feature = "artifact")]
+struct WineViewCache {
+    lock: AtomicBool,
+    next: AtomicU32,
+    sequences: [AtomicU32; WINE_VIEW_CACHE_CAP],
+    starts: [AtomicU64; WINE_VIEW_CACHE_CAP],
+    ends: [AtomicU64; WINE_VIEW_CACHE_CAP],
+    /// Start of everything the answer depends on: the PE header of the image
+    /// that decided an anonymous range, otherwise the range start.
+    depends: [AtomicU64; WINE_VIEW_CACHE_CAP],
+    /// `generation << 1 | native`.
+    values: [AtomicU64; WINE_VIEW_CACHE_CAP],
+}
+
+#[cfg(feature = "artifact")]
+impl WineViewCache {
+    const fn new() -> Self {
+        Self {
+            lock: AtomicBool::new(false),
+            next: AtomicU32::new(0),
+            sequences: [const { AtomicU32::new(0) }; WINE_VIEW_CACHE_CAP],
+            starts: [const { AtomicU64::new(0) }; WINE_VIEW_CACHE_CAP],
+            ends: [const { AtomicU64::new(0) }; WINE_VIEW_CACHE_CAP],
+            depends: [const { AtomicU64::new(0) }; WINE_VIEW_CACHE_CAP],
+            values: [const { AtomicU64::new(0) }; WINE_VIEW_CACHE_CAP],
+        }
+    }
+
+    fn lookup(&self, address: u64, generation: u64) -> Option<bool> {
+        for index in 0..WINE_VIEW_CACHE_CAP {
+            let before = self.sequences[index].load(Ordering::Acquire);
+            if before & 1 != 0 {
+                continue;
+            }
+            let start = self.starts[index].load(Ordering::Relaxed);
+            let end = self.ends[index].load(Ordering::Relaxed);
+            let value = self.values[index].load(Ordering::Relaxed);
+            fence(Ordering::Acquire);
+            if self.sequences[index].load(Ordering::Relaxed) == before
+                && (start..end).contains(&address)
+                && value >> 1 == generation
+            {
+                return Some(value & 1 != 0);
+            }
+        }
+        None
+    }
+
+    /// Skips caching rather than spinning if another insert is in progress:
+    /// this runs inside the SIGSEGV handler, possibly on top of that insert.
+    fn insert(&self, start: u64, depend: u64, end: u64, generation: u64, native: bool) {
+        if generation >> 63 != 0
+            || self
+                .lock
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        // Several threads can miss on the same cold range at once.
+        if self.lookup(start, generation).is_some() && self.lookup(end - 1, generation).is_some() {
+            self.lock.store(false, Ordering::Release);
+            return;
+        }
+        let index = self.next.load(Ordering::Relaxed) as usize % WINE_VIEW_CACHE_CAP;
+        self.next.store((index + 1) as u32, Ordering::Relaxed);
+        let sequence = self.sequences[index].load(Ordering::Relaxed);
+        self.sequences[index].store(sequence.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.starts[index].store(start, Ordering::Relaxed);
+        self.ends[index].store(end, Ordering::Relaxed);
+        self.depends[index].store(depend.min(start), Ordering::Relaxed);
+        self.values[index].store(generation << 1 | u64::from(native), Ordering::Relaxed);
+        self.sequences[index].store(sequence.wrapping_add(2), Ordering::Release);
+        self.lock.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "artifact")]
+impl WineViewCache {
+    /// Whether `[start, end)` overlaps anything a cached answer depends on.
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        (0..WINE_VIEW_CACHE_CAP).any(|index| {
+            let cached_end = self.ends[index].load(Ordering::Relaxed);
+            let depend = self.depends[index].load(Ordering::Relaxed);
+            // An entry being written is treated as overlapping: invalidating
+            // too often only costs a rescan.
+            self.sequences[index].load(Ordering::Acquire) & 1 != 0
+                || (depend < cached_end && depend < end && start < cached_end)
+        })
+    }
+
+    /// After `fork`, only this thread exists, so the cache can start empty.
+    fn reset_after_fork(&self) {
+        for index in 0..WINE_VIEW_CACHE_CAP {
+            self.starts[index].store(0, Ordering::Relaxed);
+            self.ends[index].store(0, Ordering::Relaxed);
+            self.depends[index].store(0, Ordering::Relaxed);
+            self.sequences[index].store(0, Ordering::Release);
+        }
+        self.next.store(0, Ordering::Relaxed);
+        self.lock.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "artifact")]
+static WINE_VIEW_CACHE: WineViewCache = WineViewCache::new();
+
+/// Mappings placed over memory a cached answer depends on. Unmapped code
+/// cannot run CPUID until something is mapped there again, and every such
+/// mapping made through this library's `mmap` reaches [`note_mapping`].
+/// Mappings made with raw syscalls (the dynamic loader) or `mremap` are not
+/// seen; they rarely land on CPUID-executing game or Wine code.
+#[cfg(feature = "artifact")]
+static WINE_VIEW_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "artifact")]
+fn wine_view_generation() -> u64 {
+    maps::file_mapping_generation().wrapping_add(WINE_VIEW_INVALIDATIONS.load(Ordering::Acquire))
+}
+
+/// Called by the `mmap` interposer after every successful mapping.
+#[cfg(feature = "artifact")]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn note_mapping(start: u64, length: u64) {
+    if WINE_VIEW_CACHE.overlaps(start, start.saturating_add(length)) {
+        WINE_VIEW_INVALIDATIONS.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "artifact")]
 fn artifact_wine_system_rip(address: u64) -> bool {
+    // Read before the scan: a mapping added during it makes this entry stale.
+    let generation = wine_view_generation();
+    if let Some(native) = WINE_VIEW_CACHE.lookup(address, generation) {
+        return native;
+    }
+    let (native, range) = classify_wine_view(address);
+    if let Some((start, depend, end)) = range {
+        WINE_VIEW_CACHE.insert(start, depend, end, generation, native);
+    }
+    native
+}
+
+/// Whether `address` runs Wine system code, plus the surrounding range that
+/// gets the same answer (see `constant_wine_view_range`) and the start of the
+/// memory that answer depends on.
+#[cfg(feature = "artifact")]
+fn classify_wine_view(address: u64) -> (bool, Option<(u64, u64, u64)>) {
     let mut native = artitux::artifact_profile::native_wine_view(address, None);
-    let mut image_view = None;
+    // (start, end, view) of the closest preceding PE image containing `address`.
+    let mut image: Option<(u64, u64, bool)> = None;
+    let mut closer_image_end = 0;
+    let mut containing = None;
     maps::find_line(|line| {
         let Some(mapping) = maps::parse(line) else {
             return false;
@@ -707,18 +885,20 @@ fn artifact_wine_system_rip(address: u64) -> bool {
                 {
                     let mut pe = [0u8; 84];
                     if read_memory(header, &mut pe)
-                        && artitux::artifact_profile::pe_image_contains(
-                            mapping.start,
-                            address,
-                            &dos,
-                            &pe,
-                        )
+                        && let Some(end) =
+                            artitux::artifact_profile::pe_image_end(mapping.start, &dos, &pe)
                     {
-                        // Maps are ordered; the closest containing PE header wins.
-                        image_view = Some(artitux::artifact_profile::native_wine_view(
-                            address,
-                            Some(path),
-                        ));
+                        if address < end {
+                            // Maps are ordered; the closest containing PE header wins.
+                            image = Some((
+                                mapping.start,
+                                end,
+                                artitux::artifact_profile::native_wine_view(address, Some(path)),
+                            ));
+                            closer_image_end = 0;
+                        } else {
+                            closer_image_end = closer_image_end.max(end);
+                        }
                     }
                 }
             }
@@ -726,14 +906,30 @@ fn artifact_wine_system_rip(address: u64) -> bool {
         if !(mapping.start..mapping.end).contains(&address) {
             return false;
         }
-        native = if mapping.inode == b"0" {
-            image_view.unwrap_or(native)
+        let anonymous = mapping.inode == b"0";
+        native = if anonymous {
+            image.map_or(native, |(_, _, view)| view)
         } else {
             artitux::artifact_profile::native_wine_view(address, Some(mapping.path))
         };
+        containing = Some((mapping.start, mapping.end, anonymous));
         true
     });
-    native
+    let range = containing.and_then(|(start, end, anonymous)| {
+        let (range_start, range_end) = artitux::artifact_profile::constant_wine_view_range(
+            address,
+            (start, end),
+            anonymous,
+            image.map(|(_, end, _)| end),
+            closer_image_end,
+        )?;
+        let depend = match image {
+            Some((image_start, _, _)) if anonymous => image_start,
+            _ => range_start,
+        };
+        Some((range_start, depend, range_end))
+    });
+    (native, range)
 }
 
 fn apply_cpuid_output(registers: &mut [greg_t; 23], output: CpuidOutput) {
@@ -1446,5 +1642,91 @@ mod artifact_cpuid_output_tests {
             libc::WEXITSTATUS(status),
             if cpuid_faulting_supported { 0 } else { 170 }
         );
+    }
+}
+
+#[cfg(all(test, feature = "artifact"))]
+mod wine_view_cache_tests {
+    use super::{CallerCache, CallerKind, WineViewCache, classify_wine_view};
+    use core::sync::atomic::Ordering;
+
+    #[test]
+    fn hits_only_inside_the_range_and_for_the_same_generation() {
+        let cache = WineViewCache::new();
+        assert_eq!(cache.lookup(0x2000, 7), None);
+        cache.insert(0x1000, 0x1000, 0x3000, 7, true);
+        cache.insert(0x5000, 0x5000, 0x6000, 7, false);
+        assert_eq!(cache.lookup(0x1000, 7), Some(true));
+        assert_eq!(cache.lookup(0x2fff, 7), Some(true));
+        assert_eq!(cache.lookup(0x3000, 7), None);
+        assert_eq!(cache.lookup(0x5800, 7), Some(false));
+        // A new file mapping since the scan makes every entry stale.
+        assert_eq!(cache.lookup(0x2000, 8), None);
+        // Generations too large to pack are never cached.
+        cache.insert(0x8000, 0x8000, 0x9000, 1 << 63, true);
+        assert_eq!(cache.lookup(0x8800, 1 << 63), None);
+    }
+
+    #[test]
+    fn replaces_entries_round_robin_once_full_and_skips_duplicates() {
+        let cache = WineViewCache::new();
+        cache.insert(0x1000, 0x1000, 0x2000, 1, true);
+        cache.insert(0x1000, 0x1000, 0x2000, 1, true);
+        assert_eq!(cache.next.load(Ordering::Relaxed), 1);
+        for i in 1..super::WINE_VIEW_CACHE_CAP as u64 + 1 {
+            let start = (i + 1) * 0x1000;
+            cache.insert(start, start, start + 0x1000, 1, i % 2 == 0);
+        }
+        // The first entry was overwritten by the last one.
+        assert_eq!(cache.lookup(0x1010, 1), None);
+        let last = (super::WINE_VIEW_CACHE_CAP as u64 + 1) * 0x1000;
+        assert_eq!(cache.lookup(last + 0x10, 1), Some(true));
+    }
+
+    #[test]
+    fn overlap_covers_the_range_and_the_image_it_depends_on() {
+        let cache = WineViewCache::new();
+        // Anonymous code at 0x5000..0x7000 decided by an image whose header is at 0x1000.
+        cache.insert(0x5000, 0x1000, 0x7000, 1, false);
+        assert!(cache.overlaps(0x6000, 0x6001));
+        assert!(cache.overlaps(0x1000, 0x2000));
+        assert!(cache.overlaps(0x0, 0x1001));
+        assert!(!cache.overlaps(0x0, 0x1000));
+        assert!(!cache.overlaps(0x7000, 0x9000));
+    }
+
+    #[test]
+    fn fork_resets_the_wine_view_cache_and_repairs_half_written_caller_entries() {
+        let cache = WineViewCache::new();
+        cache.insert(0x1000, 0x1000, 0x2000, 1, true);
+        cache.lock.store(true, Ordering::Relaxed);
+        cache.sequences[1].store(5, Ordering::Relaxed);
+        cache.reset_after_fork();
+        assert_eq!(cache.lookup(0x1800, 1), None);
+        cache.insert(0x3000, 0x3000, 0x4000, 1, false);
+        assert_eq!(cache.lookup(0x3800, 1), Some(false));
+
+        let callers = CallerCache::new();
+        callers.insert(0x1000, 0x2000, CallerKind::Artifact);
+        callers.sequences[0].store(3, Ordering::Relaxed);
+        callers.lock.store(true, Ordering::Relaxed);
+        callers.reset_after_fork();
+        assert_eq!(callers.sequences[0].load(Ordering::Relaxed) & 1, 0);
+        assert_eq!(callers.lookup(0x1800), None);
+        callers.insert(0x5000, 0x6000, CallerKind::Reflex64);
+        assert_eq!(callers.lookup(0x5800), Some(CallerKind::Reflex64));
+    }
+
+    #[test]
+    fn every_address_in_a_cached_range_classifies_the_same() {
+        // Real `/proc/self/maps` of this test process: this function's own code.
+        let here = every_address_in_a_cached_range_classifies_the_same as *const () as usize as u64;
+        let (native, range) = classify_wine_view(here);
+        let (start, depend, end) = range.expect("a code mapping has a cacheable range");
+        assert!((start..end).contains(&here));
+        assert!(depend <= start);
+        for probe in [start, start + (end - start) / 2, end - 1, here] {
+            assert_eq!(classify_wine_view(probe).0, native, "address {probe:#x}");
+        }
     }
 }

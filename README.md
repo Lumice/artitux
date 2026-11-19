@@ -48,6 +48,8 @@ with LinUwUx, use LinUwUx.
 
 - Planet Zoo 2 v1.0.10
 - Anno 117: Pax Romana v3.0.1
+- Assassin's Creed Black Flag Resynced Title Update 1.0.8
+- F1.25.Update.v1.0.141.7865
 
 Artitux works with Artifact releases prepared with VBS 1.9. It does not work
 with releases prepared with VBS 2.0. Before you report a problem, find out which

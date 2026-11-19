@@ -138,6 +138,20 @@ pub(crate) fn is_syscall_bypass(xmm5: u64) -> bool {
     xmm5 == selected_bypass(HANDLER_BYPASS.load(Ordering::Acquire))
 }
 
+/// The Intel identity the registered Artifact release's hypervisor presents:
+/// the 0x1337-bypass releases report a different CPU from the 0x6969 ones.
+pub(crate) fn intel_identity() -> artitux::artifact_cpu::IntelIdentity {
+    identity_for(HANDLER_BYPASS.load(Ordering::Acquire))
+}
+
+fn identity_for(learned: u64) -> artitux::artifact_cpu::IntelIdentity {
+    if learned == artitux::artifact::SYSCALL_BYPASS_MAGIC_1337 {
+        artitux::artifact_cpu::IntelIdentity::Pentium4425Y
+    } else {
+        artitux::artifact_cpu::IntelIdentity::Core
+    }
+}
+
 fn selected_bypass(learned: u64) -> u64 {
     if learned == 0 {
         artitux::artifact::SYSCALL_BYPASS_MAGIC
@@ -405,5 +419,19 @@ mod bypass_selection_tests {
         );
         let anno = artitux::artifact::SYSCALL_BYPASS_MAGIC_1337;
         assert_eq!(super::selected_bypass(anno), anno);
+    }
+
+    #[test]
+    fn only_the_1337_handler_selects_the_pentium_identity() {
+        use artitux::artifact_cpu::IntelIdentity;
+        assert_eq!(super::identity_for(0), IntelIdentity::Core);
+        assert_eq!(
+            super::identity_for(artitux::artifact::SYSCALL_BYPASS_MAGIC),
+            IntelIdentity::Core
+        );
+        assert_eq!(
+            super::identity_for(artitux::artifact::SYSCALL_BYPASS_MAGIC_1337),
+            IntelIdentity::Pentium4425Y
+        );
     }
 }

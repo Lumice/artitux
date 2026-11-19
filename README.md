@@ -133,7 +133,7 @@ To install a specific release instead of the latest release, set
 `ARTITUX_VERSION`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | ARTITUX_VERSION=v1.0.1 bash
+curl -fsSL https://raw.githubusercontent.com/Lumice/artitux/main/install.sh | ARTITUX_VERSION=v1.0.2 bash
 ```
 
 You can also build Artitux from source. See "Build from source" below. The

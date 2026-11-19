@@ -1,4 +1,5 @@
 //! Versioned Artifact CPU metadata; no host CPU state is changed here.
+use crate::artifact_cpu::IntelIdentity;
 use crate::cpuid::{Registers, Vendor};
 
 /// Validate a PE64 header before using it to attribute an anonymous code view.
@@ -56,6 +57,7 @@ pub fn native_wine_view(address: u64, path: Option<&[u8]>) -> bool {
 /// words for everything else.
 pub fn reply(
     vendor: Vendor,
+    intel: IntelIdentity,
     leaf: u32,
     subleaf: u32,
     native: impl FnOnce() -> Registers,
@@ -63,14 +65,22 @@ pub fn reply(
     if vendor == Vendor::Unknown {
         return crate::artifact_cpu::native_words(vendor, native());
     }
-    if leaf == 1 {
-        let mut words = crate::artifact_cpu::reply(vendor, leaf, subleaf, native);
-        words[2] &=
-            !((1 << 12) | (1 << 25) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29) | (1 << 30));
+    if leaf == 1 || (0x8000_0002..=0x8000_0004).contains(&leaf) {
+        let mut words = if vendor == Vendor::Intel && intel == IntelIdentity::Pentium4425Y {
+            crate::artifact_cpu::pentium_4425y_reply(leaf, native).unwrap_or([0; 4])
+        } else {
+            crate::artifact_cpu::reply(vendor, leaf, subleaf, native)
+        };
+        if leaf == 1 {
+            words[2] &= !((1 << 12)
+                | (1 << 25)
+                | (1 << 26)
+                | (1 << 27)
+                | (1 << 28)
+                | (1 << 29)
+                | (1 << 30));
+        }
         return words;
-    }
-    if (0x8000_0002..=0x8000_0004).contains(&leaf) {
-        return crate::artifact_cpu::reply(vendor, leaf, subleaf, native);
     }
     if (0x0033_6934..0x8000_0000).contains(&leaf) {
         return [0; 4];
@@ -166,7 +176,9 @@ mod tests {
             (Vendor::Intel, 0xd0670, 0x01faebff, 0xbfebfbff),
         ] {
             assert_eq!(
-                reply(vendor, 1, 0, || Registers::new(0, 0xf3000000, 0, 0)),
+                reply(vendor, IntelIdentity::Core, 1, 0, || Registers::new(
+                    0, 0xf3000000, 0, 0
+                )),
                 [eax, 0xf3100800, ecx, edx]
             );
         }
@@ -182,7 +194,10 @@ mod tests {
                 } else {
                     [0x80000000, 0xffffffff, 3, 0x80000001]
                 };
-                assert_eq!(reply(vendor, leaf, subleaf, || native), expected);
+                assert_eq!(
+                    reply(vendor, IntelIdentity::Core, leaf, subleaf, || native),
+                    expected
+                );
             }
         }
     }
@@ -190,13 +205,26 @@ mod tests {
     #[test]
     fn retains_brand_overrides_and_high_leaf_zero_range() {
         assert_eq!(
-            reply(Vendor::Intel, 0x80000004, 0, || panic!("fixed reply")),
+            reply(
+                Vendor::Intel,
+                IntelIdentity::Core,
+                0x80000004,
+                0,
+                || panic!("fixed reply")
+            ),
             [0; 4]
         );
         for vendor in [Vendor::Amd, Vendor::Intel] {
-            assert_eq!(reply(vendor, 0x336934, 0, || panic!("zero range")), [0; 4]);
             assert_eq!(
-                reply(vendor, 0x80000002, 0, || panic!("brand")),
+                reply(vendor, IntelIdentity::Core, 0x336934, 0, || panic!(
+                    "zero range"
+                )),
+                [0; 4]
+            );
+            assert_eq!(
+                reply(vendor, IntelIdentity::Core, 0x80000002, 0, || panic!(
+                    "brand"
+                )),
                 crate::artifact_cpu::reply(vendor, 0x80000002, 0, || panic!("brand"))
             );
         }
@@ -235,5 +263,41 @@ mod tests {
         assert!(!visit_writes(Vendor::Unknown, |_, _| panic!(
             "unsupported vendor"
         )));
+    }
+
+    #[test]
+    fn pentium_identity_matches_the_1337_release_hypervisor() {
+        let native = || Registers::new(0, 0xf300_0000, 0, 0);
+        let pentium = IntelIdentity::Pentium4425Y;
+        assert_eq!(
+            reply(Vendor::Intel, pentium, 1, 0, native),
+            [
+                0x000a_0655,
+                0xf320_0800,
+                0x0000_0000_73fa_fbff & !0x7e00_1000,
+                0xbfeb_fbff
+            ]
+        );
+        let mut brand = [0u8; 48];
+        for (i, leaf) in (0x8000_0002..=0x8000_0004).enumerate() {
+            let words = reply(Vendor::Intel, pentium, leaf, 0, || panic!("fixed brand"));
+            for (j, word) in words.iter().enumerate() {
+                brand[i * 16 + j * 4..][..4].copy_from_slice(&(*word as u32).to_le_bytes());
+            }
+        }
+        assert_eq!(&brand[..40], b"Intel(R) Pentium(R) CPU 4425Y @ 1.70GHz\0");
+        // AMD and other leaves are unaffected by the Intel identity.
+        for vendor in [Vendor::Amd, Vendor::Intel] {
+            assert_eq!(
+                reply(vendor, pentium, 7, 0, || Registers::new(1, 2, 3, 4)),
+                reply(vendor, IntelIdentity::Core, 7, 0, || Registers::new(
+                    1, 2, 3, 4
+                ))
+            );
+        }
+        assert_eq!(
+            reply(Vendor::Amd, pentium, 1, 0, native),
+            reply(Vendor::Amd, IntelIdentity::Core, 1, 0, native)
+        );
     }
 }

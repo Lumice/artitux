@@ -11,6 +11,34 @@ pub fn native_words(vendor: Vendor, native: Registers) -> [u64; 4] {
     }
 }
 
+/// The Intel CPU identity an Artifact release's hypervisor presents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntelIdentity {
+    /// Releases whose handler uses the 0x6969 bypass (Planet Zoo 2).
+    Core,
+    /// Releases whose handler uses the 0x1337 bypass (Anno 117, F1 25): the
+    /// hypervisor reports "Intel(R) Pentium(R) CPU 4425Y @ 1.70GHz".
+    Pentium4425Y,
+}
+
+/// Leaf 1 and brand leaves of [`IntelIdentity::Pentium4425Y`], as the
+/// release's Vmexit.c assigns them. Other leaves stay native there.
+pub fn pentium_4425y_reply(leaf: u32, native: impl FnOnce() -> Registers) -> Option<[u64; 4]> {
+    Some(match leaf {
+        1 => [
+            0x000a_0655,
+            0x0020_0800 | u64::from(native().ebx & 0xff00_0000),
+            0x73fa_fbff,
+            0xbfeb_fbff,
+        ],
+        // "Intel(R) Pentium(R) CPU 4425Y @ 1.70GHz"
+        0x8000_0002 => [0x6574_6e49, 0x2952_286c, 0x6e65_5020, 0x6d75_6974],
+        0x8000_0003 => [0x2029_5228, 0x2055_5043, 0x3532_3434, 0x2040_2059],
+        0x8000_0004 => [0x3037_2e31, 0x007a_4847, 0, 0],
+        _ => return None,
+    })
+}
+
 /// Source guest assignments, not the older compatibility profiles in `cpuid`.
 /// The caller must have received `CpuidAction::Query` for the registered process.
 /// This emulates CPUID replies only; it does not change XCR0 or execute XSAVE.

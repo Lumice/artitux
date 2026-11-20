@@ -99,9 +99,6 @@ struct cpu_xcr0_state {
 
 static DEFINE_PER_CPU(struct cpu_xcr0_state, cpu_xcr0);
 
-/* Symbol lookup helper (only used during init) */
-static unsigned long (*kallsyms_lookup_fn)(const char *name);
-
 /* Tracepoints */
 static struct tracepoint *tp_sched_switch;
 static struct tracepoint *tp_sched_fork;
@@ -1025,19 +1022,6 @@ static void find_tracepoints_cb(struct tracepoint *tp, void *priv)
 		tp_sched_free = tp;
 }
 
-static int resolve_kallsyms_lookup(void)
-{
-	struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
-	int ret;
-
-	ret = register_kprobe(&kp);
-	if (ret)
-		return ret;
-	kallsyms_lookup_fn = (unsigned long (*)(const char *))kp.addr;
-	unregister_kprobe(&kp);
-	return kallsyms_lookup_fn ? 0 : -ENOENT;
-}
-
 /* Kernel FPU functions that require host_xcr0 before executing. */
 static const char *const fpu_restore_syms[] = {
 	"kernel_fpu_begin_mask",
@@ -1061,25 +1045,14 @@ static int register_xcr0_hooks(void)
 	unsigned int i;
 	int ret;
 
-	if (kallsyms_lookup_fn("switch_fpu_return"))
-		switch_fpu_sym = "switch_fpu_return";
-	else if (kallsyms_lookup_fn("fpregs_restore_userregs"))
-		switch_fpu_sym = "fpregs_restore_userregs";
-	else {
-		pr_err("artitux_kmod: neither switch_fpu_return nor fpregs_restore_userregs found\n");
-		return -ENOENT;
-	}
-
 	/* Register plain ftrace pre-call restore hooks (no IPMODIFY, no SAVE_REGS). */
 	fpu_restore_ops.func = fpu_restore_ftrace_cb;
 	fpu_restore_ops.flags = FTRACE_OPS_FL_RECURSION;
 
 	for (i = 0; i < ARRAY_SIZE(fpu_restore_syms); i++) {
-		unsigned long addr = kallsyms_lookup_fn(fpu_restore_syms[i]);
-
-		if (!addr)
-			continue;
-		ret = ftrace_set_filter_ip(&fpu_restore_ops, addr, 0, 0);
+		ret = ftrace_set_filter(&fpu_restore_ops,
+					(unsigned char *)fpu_restore_syms[i],
+					strlen(fpu_restore_syms[i]), 0);
 		if (ret) {
 			pr_debug("artitux_kmod: skip non-traceable %s (%d)\n",
 				 fpu_restore_syms[i], ret);
@@ -1102,47 +1075,63 @@ static int register_xcr0_hooks(void)
 #ifdef CONFIG_FPROBE
 	fp_switch_fpu.entry_handler = fp_switch_fpu_entry;
 	fp_switch_fpu.exit_handler = fp_switch_fpu_exit;
+	switch_fpu_sym = "switch_fpu_return";
 	ret = register_fprobe(&fp_switch_fpu, switch_fpu_sym, NULL);
 	if (ret) {
-		pr_err("artitux_kmod: register_fprobe(%s) failed: %d\n", switch_fpu_sym, ret);
+		memset(&fp_switch_fpu, 0, sizeof(fp_switch_fpu));
+		fp_switch_fpu.entry_handler = fp_switch_fpu_entry;
+		fp_switch_fpu.exit_handler = fp_switch_fpu_exit;
+		switch_fpu_sym = "fpregs_restore_userregs";
+		ret = register_fprobe(&fp_switch_fpu, switch_fpu_sym, NULL);
+	}
+	if (ret) {
+		pr_err("artitux_kmod: register_fprobe(switch_fpu_return/fpregs_restore_userregs) failed: %d\n",
+		       ret);
 		return ret;
 	}
 	probe_switch_fpu_reg = true;
 
-	if (kallsyms_lookup_fn("fpu_xstate_prctl")) {
-		fp_xstate_prctl.entry_handler = fp_xstate_prctl_entry;
-		fp_xstate_prctl.exit_handler = fp_xstate_prctl_exit;
-		fp_xstate_prctl.entry_data_size = sizeof(struct xstate_prctl_data);
-		ret = register_fprobe(&fp_xstate_prctl, "fpu_xstate_prctl", NULL);
-		if (ret)
-			pr_warn("artitux_kmod: fpu_xstate_prctl hook failed (%d), continuing\n", ret);
-		else
-			probe_xstate_prctl_reg = true;
-	}
+	fp_xstate_prctl.entry_handler = fp_xstate_prctl_entry;
+	fp_xstate_prctl.exit_handler = fp_xstate_prctl_exit;
+	fp_xstate_prctl.entry_data_size = sizeof(struct xstate_prctl_data);
+	ret = register_fprobe(&fp_xstate_prctl, "fpu_xstate_prctl", NULL);
+	if (ret)
+		pr_debug("artitux_kmod: fpu_xstate_prctl hook skipped (%d)\n", ret);
+	else
+		probe_xstate_prctl_reg = true;
 #else
+	switch_fpu_sym = "switch_fpu_return";
 	krp_switch_fpu.kp.symbol_name = switch_fpu_sym;
 	krp_switch_fpu.entry_handler = krp_switch_fpu_entry;
 	krp_switch_fpu.handler = krp_switch_fpu_exit;
 	krp_switch_fpu.maxactive = 256;
 	ret = register_kretprobe(&krp_switch_fpu);
 	if (ret) {
-		pr_err("artitux_kmod: register_kretprobe(%s) failed: %d\n", switch_fpu_sym, ret);
+		memset(&krp_switch_fpu, 0, sizeof(krp_switch_fpu));
+		switch_fpu_sym = "fpregs_restore_userregs";
+		krp_switch_fpu.kp.symbol_name = switch_fpu_sym;
+		krp_switch_fpu.entry_handler = krp_switch_fpu_entry;
+		krp_switch_fpu.handler = krp_switch_fpu_exit;
+		krp_switch_fpu.maxactive = 256;
+		ret = register_kretprobe(&krp_switch_fpu);
+	}
+	if (ret) {
+		pr_err("artitux_kmod: register_kretprobe(switch_fpu_return/fpregs_restore_userregs) failed: %d\n",
+		       ret);
 		return ret;
 	}
 	probe_switch_fpu_reg = true;
 
-	if (kallsyms_lookup_fn("fpu_xstate_prctl")) {
-		krp_xstate_prctl.kp.symbol_name = "fpu_xstate_prctl";
-		krp_xstate_prctl.entry_handler = krp_xstate_prctl_entry;
-		krp_xstate_prctl.handler = krp_xstate_prctl_exit;
-		krp_xstate_prctl.data_size = sizeof(struct xstate_prctl_data);
-		krp_xstate_prctl.maxactive = 256;
-		ret = register_kretprobe(&krp_xstate_prctl);
-		if (ret)
-			pr_warn("artitux_kmod: fpu_xstate_prctl hook failed (%d), continuing\n", ret);
-		else
-			probe_xstate_prctl_reg = true;
-	}
+	krp_xstate_prctl.kp.symbol_name = "fpu_xstate_prctl";
+	krp_xstate_prctl.entry_handler = krp_xstate_prctl_entry;
+	krp_xstate_prctl.handler = krp_xstate_prctl_exit;
+	krp_xstate_prctl.data_size = sizeof(struct xstate_prctl_data);
+	krp_xstate_prctl.maxactive = 256;
+	ret = register_kretprobe(&krp_xstate_prctl);
+	if (ret)
+		pr_debug("artitux_kmod: fpu_xstate_prctl hook skipped (%d)\n", ret);
+	else
+		probe_xstate_prctl_reg = true;
 #endif
 
 	ret = tracepoint_probe_register(tp_sched_switch, tp_on_sched_switch, NULL);
@@ -1160,8 +1149,6 @@ static int register_umip_hook(void)
 	int ret;
 
 	if (!boot_cpu_has(X86_FEATURE_UMIP))
-		return 0;
-	if (!kallsyms_lookup_fn("fixup_umip_exception"))
 		return 0;
 
 #ifdef CONFIG_FPROBE
@@ -1308,12 +1295,6 @@ static int __init artitux_kmod_init(void)
 	if (!policy_cache)
 		return -ENOMEM;
 
-	ret = resolve_kallsyms_lookup();
-	if (ret) {
-		pr_err("artitux_kmod: failed to resolve kallsyms_lookup_name: %d\n", ret);
-		goto fail;
-	}
-
 	for_each_kernel_tracepoint(find_tracepoints_cb, NULL);
 	if (!tp_sched_switch || !tp_sched_fork || !tp_sched_exec || !tp_sched_free) {
 		pr_err("artitux_kmod: missing required sched tracepoints\n");
@@ -1327,11 +1308,6 @@ static int __init artitux_kmod_init(void)
 			host_capabilities |= ARTITUX_CAP_XCR0_NATIVE;
 			pr_info("artitux_kmod: host XCR0 is already 0x7 natively\n");
 		} else if ((host_xcr0 & ARTITUX_XCR0_TARGET) == ARTITUX_XCR0_TARGET) {
-			if (kallsyms_lookup_fn("xcr0_task_active")) {
-				pr_err("artitux_kmod: pingu_policy is currently loaded and conflicts with lazy XCR0; reboot without pingu_policy first\n");
-				ret = -EBUSY;
-				goto fail;
-			}
 			ret = register_xcr0_hooks();
 			if (ret)
 				goto fail;

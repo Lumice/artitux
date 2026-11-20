@@ -56,8 +56,10 @@ VBS 2.0 support is experimental. See [VBS 2.0](#vbs-20).
 - CPUID faulting, FSGSBASE in user space, and UMIP disabled or handled.
   `artitux --check` checks all of these:
   - **UMIP**: Intel 9th generation and newer and AMD Ryzen 3000 and newer
-    usually have it. Load the `umip_patch` module (not included with Artitux).
-    The `clearcpuid=514` kernel parameter is not tested yet.
+    usually have it. Install the included `artitux_kmod` module in
+    [kmod/](kmod/README.md) (recommended: handles both UMIP and VBS 2.0
+    `XCR0 = 0x7` per-process), or load `umip_patch`. The `clearcpuid=514`
+    kernel parameter is not tested yet.
   - **CPUID faulting**: AMD AM4 CPUs up to the Ryzen 5000 series and the Steam
     Deck need the `cpuid_fault_emulation` DKMS module (not included). It needs
     the kernel headers and AMD virtualization enabled in the firmware.
@@ -68,10 +70,11 @@ Native 32-bit Wine processes cannot load the library and may print a
 ## VBS 2.0
 
 Artitux selects VBS 1.9 or VBS 2.0 mode by itself. VBS 2.0 releases need the
-CPU state XCR0 to be exactly `0x7`, which usually means turning off AVX-512
-and PKU with a kernel parameter. The `XCR0` line in `artitux --check` shows
-whether your system is ready. See [docs/vbs-2.0.md](docs/vbs-2.0.md) for the
-steps and for a way to keep AVX-512 for other programs.
+CPU state XCR0 to be `0x7`. The `XCR0` line in `artitux --check` shows whether
+your system is ready. Install the included [artitux_kmod](kmod/README.md)
+module to apply `XCR0 = 0x7` automatically only to VBS 2.0 games while keeping
+AVX-512 enabled for everything else, or use a `clearcpuid` kernel parameter.
+See [docs/vbs-2.0.md](docs/vbs-2.0.md) for setup steps.
 
 ## Troubleshooting
 

@@ -111,6 +111,8 @@ check() {
         report UMIP unknown "cannot read the CPU flags from /proc/cpuinfo"
     elif ! has_flag umip; then
         report UMIP ok "disabled"
+    elif [ -d /sys/module/artitux_kmod ] && [ -w /dev/artitux ]; then
+        report UMIP ok "enabled, handled per-process by artitux_kmod"
     elif [ -d /sys/module/umip_patch ]; then
         report UMIP ok "enabled, but the umip_patch module is loaded"
     else
@@ -142,6 +144,8 @@ check() {
         if has_flag amx_tile; then extra="${extra:+$extra,}amx_tile"; fi
         if [ -z "$extra" ]; then
             report XCR0 ok "0x7, ready for VBS 2.0"
+        elif [ -d /sys/module/artitux_kmod ] && [ -w /dev/artitux ]; then
+            report XCR0 ok "0x7 per-process for VBS 2.0 via artitux_kmod (host keeps $extra)"
         else
             report XCR0 info "not 0x7; VBS 2.0 needs clearcpuid=$extra (see docs/vbs-2.0.md)"
         fi
@@ -285,6 +289,82 @@ steam_ids() {
     done
 }
 steam_ids "$@"
+
+# If artitux_kmod is loaded (/dev/artitux), arm per-process policies on this
+# shell PID right before exec so they survive fork, threads, exec, and
+# pressure-vessel containers. UMIP is armed by default; XCR0 = 0x7 is armed
+# only for VBS 2.0 releases (or when forced via ARTITUX_XCR0 / ARTITUX_VBS20).
+arm_kmod() {
+    if [ ! -w /dev/artitux ]; then
+        return 0
+    fi
+    want_umip=1
+    want_xcr0=0
+    if [ "${ARTITUX_UMIP-1}" = 0 ]; then
+        want_umip=0
+    fi
+    case "${ARTITUX_XCR0-}" in
+        1) want_xcr0=1 ;;
+        0) want_xcr0=0 ;;
+        "")
+            case "${ARTITUX_VBS20-}" in
+                1) want_xcr0=1 ;;
+                0) want_xcr0=0 ;;
+                "")
+                    for arg in "$@"; do
+                        case "$arg" in
+                            *.[eE][xX][eE]) ;;
+                            *) continue ;;
+                        esac
+                        [ -f "$arg" ] || continue
+                        case "$arg" in
+                            */*) dir=${arg%/*} ;;
+                            *) dir=. ;;
+                        esac
+                        found_dll=""
+                        if [ -r "$dir/artifact.dll" ]; then
+                            found_dll="$dir/artifact.dll"
+                        else
+                            # Launcher stub may sit in a subdir (e.g. steam/PBZ.exe -> ../platform/steam/artifact.dll)
+                            # or root above Binaries/Win64/artifact.dll. Check bounded game-local paths only.
+                            set +f
+                            for cand in \
+                                "$dir"/../artifact.dll \
+                                "$dir"/../../artifact.dll \
+                                "$dir"/../platform/*/artifact.dll \
+                                "$dir"/*/artifact.dll \
+                                "$dir"/*/*/artifact.dll \
+                                "$dir"/*/*/*/artifact.dll; do
+                                if [ -r "$cand" ]; then
+                                    found_dll="$cand"
+                                    break
+                                fi
+                            done
+                            set -f
+                        fi
+                        if [ -n "$found_dll" ] &&
+                           LC_ALL=C grep -Fqa "Run specifically the included VBS.cmd" "$found_dll" 2>/dev/null; then
+                            want_xcr0=1
+                        fi
+                        break
+                    done
+                    ;;
+            esac
+            ;;
+    esac
+
+    req=""
+    if [ "$want_umip" = 1 ]; then req="umip"; fi
+    if [ "$want_xcr0" = 1 ]; then req="${req:+$req }xcr0"; fi
+    if [ -n "$req" ]; then
+        if echo "$req" >/dev/artitux 2>/dev/null; then
+            if [ "${ARTITUX_DEBUG-}" = 1 ]; then
+                echo "artitux: armed /dev/artitux ($req)" >&2
+            fi
+        fi
+    fi
+}
+arm_kmod "$@"
 
 export LD_PRELOAD="$lib${filtered:+:$filtered}"
 exec "$@"

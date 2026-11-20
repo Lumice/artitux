@@ -6,6 +6,8 @@ Set these variables before the wrapper in the launch options, for example
 | Variable | Effect |
 | --- | --- |
 | `ARTITUX_VBS20=1` or `0` | Forces VBS 2.0 or VBS 1.9 mode instead of the automatic choice. See [vbs-2.0.md](vbs-2.0.md) |
+| `ARTITUX_XCR0=1` or `0` | Forces or disables per-process `XCR0 = 0x7` via `artitux_kmod` (`/dev/artitux`) |
+| `ARTITUX_UMIP=0` | Disables per-process UMIP arming via `artitux_kmod` (`/dev/artitux`) |
 | `ARTITUX_DEBUG=1` | Turns on diagnostics |
 | `ARTITUX_LOG=/absolute/path.log` | Writes diagnostics to a private file |
 | `ARTITUX_STEAM_IDS=0` | Turns off the [Steam app ID](#steam-app-id) handling |

@@ -114,7 +114,7 @@ check() {
     elif [ -d /sys/module/umip_patch ]; then
         report UMIP ok "enabled, but the umip_patch module is loaded"
     else
-        report UMIP FAIL "enabled (see \"Disable UMIP\" in the README)"
+        report UMIP FAIL "enabled (see \"Requirements\" in the README)"
     fi
 
     if [ -z "$flags" ]; then
@@ -124,7 +124,27 @@ check() {
     elif [ -d /sys/module/cpuid_fault_emulation ]; then
         report CPUID ok "CPUID faulting comes from the cpuid_fault_emulation module"
     else
-        report CPUID FAIL "CPUID faulting is not available (see \"CPUID faulting on AMD\" in the README)"
+        report CPUID FAIL "CPUID faulting is not available (see \"Requirements\" in the README)"
+    fi
+
+    # VBS 2.0 needs XCR0 = 0x7 (x87, SSE, AVX). XGETBV is not available from
+    # the shell, but clearcpuid also removes the matching flags, so the flags
+    # show which state components the kernel enabled. Only VBS 2.0 needs this,
+    # so it is never a failure.
+    if [ -z "$flags" ]; then
+        report XCR0 unknown "cannot read the CPU flags from /proc/cpuinfo"
+    elif ! has_flag avx; then
+        report XCR0 info "no AVX, so VBS 2.0 cannot run on this CPU"
+    else
+        extra=""
+        if has_flag avx512f; then extra="avx512f"; fi
+        if has_flag ospke; then extra="${extra:+$extra,}pku"; fi
+        if has_flag amx_tile; then extra="${extra:+$extra,}amx_tile"; fi
+        if [ -z "$extra" ]; then
+            report XCR0 ok "0x7, ready for VBS 2.0"
+        else
+            report XCR0 info "not 0x7; VBS 2.0 needs clearcpuid=$extra (see docs/vbs-2.0.md)"
+        fi
     fi
 
     # Artifact games need the kernel to allow FSGSBASE in user space

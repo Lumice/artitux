@@ -95,10 +95,46 @@ pub fn constant_wine_view_range(
     (start..end).contains(&address).then_some((start, end))
 }
 
-/// CPUID reply for an Artifact query: hypervisor identity and brand leaves,
-/// XSAVE/AVX bits masked in leaf 1, a zeroed high-leaf range, and native
-/// words for everything else.
+/// Which hypervisor generation an Artifact release's tokens were made with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Generation {
+    /// VBS 1.9: leaf 1 and brand fixed, XSAVE/AVX masked, other leaves
+    /// native, KUSER processor-feature and XSTATE fields cleared.
+    Vbs19,
+    /// VBS 2.0: the full fixed CPUID table with AVX/XSAVE reported, and only
+    /// the identity KUSER writes. Its tokens expect XCR0 = 0x7.
+    Vbs20,
+}
+
+/// Text of the dialog an `artifact.dll` shows when the host's XCR0 is not
+/// the 0x7 its VBS 2.0 tokens were made with. VBS 1.9 builds do not have it.
+pub const VBS20_MARKER: &[u8] = b"Run specifically the included VBS.cmd";
+
+/// Whether `image` (a whole `artifact.dll`, or a chunk of it) contains
+/// [`VBS20_MARKER`].
+pub fn contains_vbs20_marker(image: &[u8]) -> bool {
+    image
+        .windows(VBS20_MARKER.len())
+        .any(|window| window == VBS20_MARKER)
+}
+
+/// Choose the generation for a session: the `ARTITUX_VBS20` override
+/// (`forced`), else VBS 2.0 exactly when the release's `artifact.dll`
+/// contains [`VBS20_MARKER`].
+pub fn select_generation(forced: Option<bool>, vbs20_marker: bool) -> Generation {
+    match forced {
+        Some(true) => Generation::Vbs20,
+        Some(false) => Generation::Vbs19,
+        None if vbs20_marker => Generation::Vbs20,
+        None => Generation::Vbs19,
+    }
+}
+
+/// CPUID reply for an Artifact query. VBS 1.9: hypervisor identity and brand
+/// leaves, XSAVE/AVX bits masked in leaf 1, a zeroed high-leaf range, and
+/// native words for everything else. VBS 2.0: the source's full table.
 pub fn reply(
+    generation: Generation,
     vendor: Vendor,
     intel: IntelIdentity,
     leaf: u32,
@@ -107,6 +143,9 @@ pub fn reply(
 ) -> [u64; 4] {
     if vendor == Vendor::Unknown {
         return crate::artifact_cpu::native_words(vendor, native());
+    }
+    if generation == Generation::Vbs20 {
+        return crate::artifact_cpu::reply(vendor, leaf, subleaf, native);
     }
     if leaf == 1 || (0x8000_0002..=0x8000_0004).contains(&leaf) {
         let mut words = if vendor == Vendor::Intel && intel == IntelIdentity::Pentium4425Y {
@@ -132,11 +171,18 @@ pub fn reply(
 }
 
 /// KUSER_SHARED_DATA writes for Artifact: the shared identity fields, then
-/// the processor-feature and XSTATE fields cleared. Wine's clock fields and
-/// the gaps between ranges are left alone.
-pub fn visit_writes(vendor: Vendor, mut write: impl FnMut(usize, u8)) -> bool {
+/// for VBS 1.9 the processor-feature and XSTATE fields cleared. Wine's clock
+/// fields and the gaps between ranges are left alone.
+pub fn visit_writes(
+    generation: Generation,
+    vendor: Vendor,
+    mut write: impl FnMut(usize, u8),
+) -> bool {
     if !crate::kuser::visit_artifact_writes(vendor, &mut write) {
         return false;
+    }
+    if generation == Generation::Vbs20 {
+        return true;
     }
     for at in [0x285, 0x290, 0x294, 0x295, 0x297, 0x29b, 0x29c] {
         write(at, 0);
@@ -219,9 +265,9 @@ mod tests {
             (Vendor::Intel, 0xd0670, 0x01faebff, 0xbfebfbff),
         ] {
             assert_eq!(
-                reply(vendor, IntelIdentity::Core, 1, 0, || Registers::new(
-                    0, 0xf3000000, 0, 0
-                )),
+                reply(Generation::Vbs19, vendor, IntelIdentity::Core, 1, 0, || {
+                    Registers::new(0, 0xf3000000, 0, 0)
+                }),
                 [eax, 0xf3100800, ecx, edx]
             );
         }
@@ -238,7 +284,14 @@ mod tests {
                     [0x80000000, 0xffffffff, 3, 0x80000001]
                 };
                 assert_eq!(
-                    reply(vendor, IntelIdentity::Core, leaf, subleaf, || native),
+                    reply(
+                        Generation::Vbs19,
+                        vendor,
+                        IntelIdentity::Core,
+                        leaf,
+                        subleaf,
+                        || native
+                    ),
                     expected
                 );
             }
@@ -246,9 +299,83 @@ mod tests {
     }
 
     #[test]
+    fn generation_follows_the_override_then_the_marker() {
+        for marker in [false, true] {
+            assert_eq!(select_generation(Some(true), marker), Generation::Vbs20);
+            assert_eq!(select_generation(Some(false), marker), Generation::Vbs19);
+        }
+        assert_eq!(select_generation(None, true), Generation::Vbs20);
+        assert_eq!(select_generation(None, false), Generation::Vbs19);
+    }
+
+    #[test]
+    fn marker_is_found_anywhere_in_the_image() {
+        let mut image = [0u8; 4096];
+        assert!(!contains_vbs20_marker(&image));
+        image[1000..1000 + VBS20_MARKER.len()].copy_from_slice(VBS20_MARKER);
+        assert!(contains_vbs20_marker(&image));
+        assert!(!contains_vbs20_marker(
+            &VBS20_MARKER[..VBS20_MARKER.len() - 1]
+        ));
+        assert!(contains_vbs20_marker(VBS20_MARKER));
+    }
+
+    #[test]
+    fn vbs20_uses_the_full_source_table_with_avx_reported() {
+        for vendor in [Vendor::Amd, Vendor::Intel] {
+            for (leaf, subleaf) in [(0, 0), (1, 0), (7, 0), (0xd, 0), (0xd, 1), (0x80000001, 0)] {
+                let native = Registers::new(0x1234, 0xf300_0000, 0x5678, 0x9abc);
+                assert_eq!(
+                    reply(
+                        Generation::Vbs20,
+                        vendor,
+                        IntelIdentity::Core,
+                        leaf,
+                        subleaf,
+                        || native
+                    ),
+                    crate::artifact_cpu::reply(vendor, leaf, subleaf, || native)
+                );
+            }
+            let leaf1 = reply(Generation::Vbs20, vendor, IntelIdentity::Core, 1, 0, || {
+                Registers::new(0, 0, 0, 0)
+            });
+            assert_eq!(leaf1[2] & (1 << 27 | 1 << 28), 1 << 27 | 1 << 28);
+            assert_eq!(
+                reply(
+                    Generation::Vbs20,
+                    vendor,
+                    IntelIdentity::Core,
+                    0xd,
+                    0,
+                    || panic!("fixed")
+                )[0],
+                0x207
+            );
+        }
+    }
+
+    #[test]
+    fn vbs20_kuser_writes_keep_wine_xstate_and_feature_bytes() {
+        for vendor in [Vendor::Amd, Vendor::Intel] {
+            let mut page = [0xa5u8; crate::kuser::PAGE_SIZE];
+            assert!(visit_writes(Generation::Vbs20, vendor, |at, byte| page
+                [at] =
+                byte));
+            assert!(page[0x3d8..0x3e8].iter().all(|&b| b == 0xa5));
+            assert!(page[0x3ec..0x600].iter().all(|&b| b == 0xa5));
+            assert_eq!(page[0x285], 1);
+            assert_eq!(page[0x29b], 1);
+            assert_eq!(page[0x295], 1);
+            assert_eq!(page[0x297], u8::from(vendor == Vendor::Amd));
+        }
+    }
+
+    #[test]
     fn retains_brand_overrides_and_high_leaf_zero_range() {
         assert_eq!(
             reply(
+                Generation::Vbs19,
                 Vendor::Intel,
                 IntelIdentity::Core,
                 0x80000004,
@@ -259,15 +386,25 @@ mod tests {
         );
         for vendor in [Vendor::Amd, Vendor::Intel] {
             assert_eq!(
-                reply(vendor, IntelIdentity::Core, 0x336934, 0, || panic!(
-                    "zero range"
-                )),
+                reply(
+                    Generation::Vbs19,
+                    vendor,
+                    IntelIdentity::Core,
+                    0x336934,
+                    0,
+                    || panic!("zero range")
+                ),
                 [0; 4]
             );
             assert_eq!(
-                reply(vendor, IntelIdentity::Core, 0x80000002, 0, || panic!(
-                    "brand"
-                )),
+                reply(
+                    Generation::Vbs19,
+                    vendor,
+                    IntelIdentity::Core,
+                    0x80000002,
+                    0,
+                    || panic!("brand")
+                ),
                 crate::artifact_cpu::reply(vendor, 0x80000002, 0, || panic!("brand"))
             );
         }
@@ -277,7 +414,9 @@ mod tests {
     fn kuser_clears_exact_source_xstate_ranges_preserving_wine_clock_and_gaps() {
         for vendor in [Vendor::Amd, Vendor::Intel] {
             let mut page = [0xa5; crate::kuser::PAGE_SIZE];
-            assert!(visit_writes(vendor, |at, byte| page[at] = byte));
+            assert!(visit_writes(Generation::Vbs19, vendor, |at, byte| page
+                [at] =
+                byte));
             for at in [0x285, 0x290, 0x294, 0x295, 0x297, 0x29b, 0x29c] {
                 assert_eq!(page[at], 0);
             }
@@ -303,9 +442,11 @@ mod tests {
 
     #[test]
     fn unknown_vendor_is_not_supported() {
-        assert!(!visit_writes(Vendor::Unknown, |_, _| panic!(
-            "unsupported vendor"
-        )));
+        assert!(!visit_writes(
+            Generation::Vbs19,
+            Vendor::Unknown,
+            |_, _| panic!("unsupported vendor")
+        ));
     }
 
     #[test]
@@ -313,7 +454,7 @@ mod tests {
         let native = || Registers::new(0, 0xf300_0000, 0, 0);
         let pentium = IntelIdentity::Pentium4425Y;
         assert_eq!(
-            reply(Vendor::Intel, pentium, 1, 0, native),
+            reply(Generation::Vbs19, Vendor::Intel, pentium, 1, 0, native),
             [
                 0x000a_0655,
                 0xf320_0800,
@@ -323,7 +464,9 @@ mod tests {
         );
         let mut brand = [0u8; 48];
         for (i, leaf) in (0x8000_0002..=0x8000_0004).enumerate() {
-            let words = reply(Vendor::Intel, pentium, leaf, 0, || panic!("fixed brand"));
+            let words = reply(Generation::Vbs19, Vendor::Intel, pentium, leaf, 0, || {
+                panic!("fixed brand")
+            });
             for (j, word) in words.iter().enumerate() {
                 brand[i * 16 + j * 4..][..4].copy_from_slice(&(*word as u32).to_le_bytes());
             }
@@ -332,15 +475,24 @@ mod tests {
         // AMD and other leaves are unaffected by the Intel identity.
         for vendor in [Vendor::Amd, Vendor::Intel] {
             assert_eq!(
-                reply(vendor, pentium, 7, 0, || Registers::new(1, 2, 3, 4)),
-                reply(vendor, IntelIdentity::Core, 7, 0, || Registers::new(
+                reply(Generation::Vbs19, vendor, pentium, 7, 0, || Registers::new(
                     1, 2, 3, 4
-                ))
+                )),
+                reply(Generation::Vbs19, vendor, IntelIdentity::Core, 7, 0, || {
+                    Registers::new(1, 2, 3, 4)
+                })
             );
         }
         assert_eq!(
-            reply(Vendor::Amd, pentium, 1, 0, native),
-            reply(Vendor::Amd, IntelIdentity::Core, 1, 0, native)
+            reply(Generation::Vbs19, Vendor::Amd, pentium, 1, 0, native),
+            reply(
+                Generation::Vbs19,
+                Vendor::Amd,
+                IntelIdentity::Core,
+                1,
+                0,
+                native
+            )
         );
     }
 

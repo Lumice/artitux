@@ -16,10 +16,19 @@ Proton behaviour.
 
 ## Development
 
-Build with the Rust version and host tools listed in the README. Create a branch
-from `main`, make one focused change, and keep the unsafe boundary as small and
-clear as possible. Prefer descriptive names and simple control flow over source
-comments.
+Install Rust 1.98 or newer, a native C linker, and GNU binutils. Then build the
+library:
+
+```sh
+cargo xtask build
+```
+
+It is written to `target/runtime/Artitux.so`. Use `--debug` for a debug build
+or `--output /absolute/path/Artitux.so` for another location.
+
+Create a branch from `main`, make one focused change, and keep the unsafe
+boundary as small and clear as possible. Prefer descriptive names and simple
+control flow over source comments.
 
 Run these checks before opening a pull request:
 

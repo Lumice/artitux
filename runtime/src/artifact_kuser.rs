@@ -625,9 +625,13 @@ pub(crate) fn apply_profile(vendor: Vendor) -> bool {
     } else {
         Vendor::Amd
     };
-    let applied = artitux::artifact_profile::visit_writes(vendor, |offset, byte| {
-        unsafe { &*destination.add(offset).cast::<AtomicU8>() }.store(byte, Ordering::Relaxed);
-    });
+    let applied = artitux::artifact_profile::visit_writes(
+        crate::config::artifact_generation(),
+        vendor,
+        |offset, byte| {
+            unsafe { &*destination.add(offset).cast::<AtomicU8>() }.store(byte, Ordering::Relaxed);
+        },
+    );
     PROFILE.store(if applied { published } else { 0 }, Ordering::Release);
     applied
 }

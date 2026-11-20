@@ -154,6 +154,15 @@ pub unsafe extern "C" fn syscallhook(sig: c_int, info: *mut siginfo_t, context: 
         unsafe {
             let context = context.cast::<ucontext_t>();
             #[cfg(feature = "artifact")]
+            match ptr::addr_of!((*info).si_code).read() {
+                SYS_USER_DISPATCH => crate::artifact_seccomp::note_dispatch_trap(),
+                // A Windows syscall that leaked past dispatch: rewind it so
+                // dispatch handles it. Must run before the guard below, whose
+                // drop would restore the leaked ALLOW selector.
+                SYS_SECCOMP if crate::artifact_seccomp::repair_leak(context) => return,
+                _ => {}
+            }
+            #[cfg(feature = "artifact")]
             let _dispatch_guard = crate::artifact::wine_dispatch_guard();
             #[cfg(feature = "artifact")]
             let artifact_target = if crate::artifact::active() {
@@ -163,6 +172,13 @@ pub unsafe extern "C" fn syscallhook(sig: c_int, info: *mut siginfo_t, context: 
             };
             #[cfg(not(feature = "artifact"))]
             let artifact_target = None;
+            // Artifact is active and this Wine uses dispatch: arm the trap.
+            #[cfg(feature = "artifact")]
+            if artifact_target.is_some()
+                && ptr::addr_of!((*info).si_code).read() == SYS_USER_DISPATCH
+            {
+                let _ = crate::artifact_seccomp::install_once();
+            }
             redirect(info, context, artifact_target, |ctx| {
                 let mut target = 0;
                 let mut rax_is_resume = 0;

@@ -50,6 +50,8 @@ mod artifact_kuser;
 #[cfg(feature = "artifact")]
 mod artifact_loader;
 #[cfg(feature = "artifact")]
+mod artifact_seccomp;
+#[cfg(feature = "artifact")]
 mod peb_heaps;
 #[cfg(feature = "artifact")]
 mod resolver;

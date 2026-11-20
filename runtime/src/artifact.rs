@@ -187,6 +187,14 @@ fn learn_handler_bypass(pid: libc::pid_t) {
     }
 }
 
+fn trace_generation() {
+    if crate::config::artifact_generation() == artitux::artifact_profile::Generation::Vbs20 {
+        trace_protocol(0x400, c"ART VBS 2.0 profile selected");
+    } else {
+        trace_protocol(0x800, c"ART VBS 1.9 profile selected");
+    }
+}
+
 /// `early_handler_allowed`: a handler leaf sent before registration may be
 /// kept (the CPUID site is not a known non-Artifact module).
 pub(crate) fn cpuid(
@@ -208,6 +216,12 @@ pub(crate) fn cpuid(
     if leaf == 0x1337 {
         trace_protocol(1, c"ART protocol register observed");
     }
+    if matches!(leaf, 0x1337 | 0x336933 | 0x1338) {
+        // From here on Artifact routes Windows syscalls through raw stubs that
+        // rely on Wine's dispatch selector; trap any that slip past it.
+        // Without an earlier dispatch trap this waits for the SIGSYS router.
+        let _ = crate::artifact_seccomp::install_once();
+    }
     if leaf == 0x336933 {
         trace_protocol(2, c"ART protocol handler observed");
         if !SESSION.is_active(pid) {
@@ -221,7 +235,9 @@ pub(crate) fn cpuid(
         trace_protocol(16, c"ART protocol readiness requested");
     }
     if leaf == 0x1338 && SESSION.is_active(pid) {
+        learn_handler_bypass(pid);
         crate::artifact_kuser::apply_profile(vendor);
+        trace_generation();
     }
     let provider_ready = leaf == 0x1338 && crate::artifact_kuser::profile_ready();
     if leaf == 0x1338 && !provider_ready {
@@ -238,7 +254,11 @@ pub(crate) fn cpuid(
         trace_protocol(8, c"ART protocol profile query observed");
     }
     if leaf == 0x1337 && SESSION.is_active(pid) {
+        // Learn the handler's bypass as early as possible: the 0x1337-bypass
+        // releases need it for their ready marker and Intel identity.
+        learn_handler_bypass(pid);
         crate::artifact_kuser::apply_profile(vendor);
+        trace_generation();
     }
     if matches!(leaf, 0x1337 | 0x336933) && SESSION.is_active(pid) {
         learn_handler_bypass(pid);
@@ -347,6 +367,29 @@ pub(crate) unsafe fn wine_dispatch_guard() -> Option<SignalDispatchGuard> {
         );
     }
     Some(SignalDispatchGuard(previous))
+}
+
+/// Put this thread's Wine dispatch selector back to BLOCK. Only for a thread
+/// that just trapped from Windows code with the selector wrongly at ALLOW.
+pub(crate) unsafe fn set_wine_dispatch_block() -> bool {
+    if !FSGSBASE_AVAILABLE.load(Ordering::Acquire) {
+        return false;
+    }
+    let gs: usize;
+    unsafe {
+        core::arch::asm!("rdgsbase {base}", base = out(reg) gs,
+            options(nomem, nostack, preserves_flags));
+    }
+    if gs == 0 {
+        return false;
+    }
+    unsafe {
+        core::arch::asm!(
+            "mov byte ptr gs:[0x340], 1",
+            options(nostack, preserves_flags)
+        );
+    }
+    true
 }
 
 impl Drop for SignalDispatchGuard {

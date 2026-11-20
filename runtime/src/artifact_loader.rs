@@ -17,6 +17,8 @@
 //!    the public copy by relinking the neighbours' back-links, all or nothing,
 //!    and tags Artifact's public-only entries so Wine never delivers DllMain
 //!    or TLS lifecycle calls to them.
+//!    If Artifact also copied the PEB, Wine's original process PEB must point
+//!    at the adopted loader data: process-information queries still return it.
 //!
 //! Any failure terminates the process with a message before Wine can walk an
 //! incoherent list.
@@ -37,6 +39,7 @@ static BOUNDARY_RAN: AtomicBool = AtomicBool::new(false);
 static ARMED: AtomicBool = AtomicBool::new(false);
 
 static CANONICAL_LDR: AtomicUsize = AtomicUsize::new(0);
+static CANONICAL_PEB: AtomicUsize = AtomicUsize::new(0);
 static ARTIFACT_ENTRY: AtomicUsize = AtomicUsize::new(0);
 static REAL_ENTRY: AtomicUsize = AtomicUsize::new(0);
 
@@ -59,6 +62,7 @@ const STATUS_DLL_INIT_FAILED: u32 = 0xC000_0142;
 // LDR_DATA_TABLE_ENTRY (x64) offsets.
 const ENTRY_DLL_BASE: usize = 0x30;
 const ENTRY_ENTRY_POINT: usize = 0x38;
+const ENTRY_SIZE_OF_IMAGE: usize = 0x40;
 const ENTRY_BASE_NAME: usize = 0x58;
 const ENTRY_FLAGS: usize = 0x68;
 const ENTRY_LOAD_COUNT: usize = 0x6c;
@@ -185,7 +189,8 @@ static SNAPSHOT_VALID: AtomicBool = AtomicBool::new(false);
 
 fn early_boundary() {
     let _errno = Errno::save();
-    let canonical = current_ldr();
+    let peb = current_peb();
+    let canonical = peek(peb + 0x18).unwrap_or(0);
     if !plausible_ldr(canonical) {
         fatal(b"artitux: Wine loader data is not readable at the kernel32 boundary\n");
     }
@@ -195,6 +200,8 @@ fn early_boundary() {
         Err(()) => fatal(b"artitux: Wine loader list is not readable at the kernel32 boundary\n"),
     };
     CANONICAL_LDR.store(canonical, Ordering::Release);
+    CANONICAL_PEB.store(peb, Ordering::Release);
+    crate::config::set_artifact_vbs20_marker(image_has_vbs20_marker(entry));
     // The resolver and the entry thunk share this image base, and Wine picks
     // the first registered table whose range [base, base + end) contains a
     // PC. Both functions are therefore registered as one sorted table.
@@ -282,6 +289,55 @@ core::arch::global_asm!(
     after = sym after_entry,
     real = sym REAL_ENTRY,
 );
+
+/// Scan the mapped `artifact.dll` (still before its DllMain) for the VBS 2.0
+/// dialog text, one page at a time so the buffer stays small on the Windows
+/// stack and an unreadable page only hides itself. A missing or implausible
+/// image counts as VBS 1.9. Kept out of line: the boundary hook that calls
+/// it runs on every `RtlReleasePebLock` from kernel32.
+#[inline(never)]
+fn image_has_vbs20_marker(entry: usize) -> bool {
+    const PAGE: usize = 0x1000;
+    const MAX_IMAGE: usize = 256 * 1024 * 1024;
+    const CARRY: usize = 64;
+    const _: () = assert!(artitux::artifact_profile::VBS20_MARKER.len() <= CARRY);
+    let keep = artitux::artifact_profile::VBS20_MARKER.len() - 1;
+    let (Some(base), Some(size)) = (
+        peek(entry + ENTRY_DLL_BASE),
+        peek_bytes::<4>(entry + ENTRY_SIZE_OF_IMAGE).map(u32::from_le_bytes),
+    ) else {
+        return false;
+    };
+    if base < MIN_USER_ADDRESS || base % PAGE != 0 {
+        return false;
+    }
+    let Some(end) = base.checked_add((size as usize).min(MAX_IMAGE)) else {
+        return false;
+    };
+    let mut buffer = [0u8; CARRY + PAGE];
+    let mut carried = 0;
+    let mut page = base;
+    while page < end {
+        let length = PAGE.min(end - page);
+        let total = carried + length;
+        if crate::resolver::read_slice(page, &mut buffer[carried..total]) {
+            if artitux::artifact_profile::contains_vbs20_marker(&buffer[..total]) {
+                return true;
+            }
+            // Carry the tail so a marker across a page boundary is found.
+            let tail = keep.min(total);
+            buffer.copy_within(total - tail..total, 0);
+            carried = tail;
+        } else {
+            carried = 0;
+        }
+        let Some(next) = page.checked_add(PAGE) else {
+            break;
+        };
+        page = next;
+    }
+    false
+}
 
 /// The entry thunk's RUNTIME_FUNCTION (begin, end, unwind RVAs relative to
 /// this image), with its UNWIND_INFO completed. None if the prologue is not
@@ -412,6 +468,12 @@ unsafe extern "win64" fn after_entry() {
         fatal(b"artitux: Artifact loader data could not be adopted\n");
     }
     tag_public_only_entries(public, &expected);
+    // NtQueryInformationProcess returns Wine's original PEB even when
+    // Artifact replaced TEB.Peb. Toolhelp walks must use the adopted head
+    // too, rather than loop through a list that never reaches the old head.
+    if !publish_process_ldr(CANONICAL_PEB.load(Ordering::Acquire), canonical, public) {
+        fatal(b"artitux: original process PEB loader data could not be updated\n");
+    }
     note(c"Artifact loader data adopted");
 }
 
@@ -556,13 +618,29 @@ fn note_count(prefix: &'static core::ffi::CStr, value: usize) {
     let _ = (prefix, value);
 }
 
-fn current_ldr() -> usize {
+fn current_peb() -> usize {
     let mut peb: usize;
     unsafe { core::arch::asm!("mov {p}, qword ptr gs:[0x60]", p = out(reg) peb) };
+    peb
+}
+
+fn current_ldr() -> usize {
+    let peb = current_peb();
     if peb == 0 {
         return 0;
     }
     peek(peb + 0x18).unwrap_or(0)
+}
+
+fn publish_process_ldr(peb: usize, canonical: usize, public: usize) -> bool {
+    let Some(slot) = peb.checked_add(0x18) else {
+        return false;
+    };
+    match peek(slot) {
+        Some(current) if current == public => true,
+        Some(current) if current == canonical => self_write(slot, &public.to_le_bytes()),
+        _ => false,
+    }
 }
 
 fn plausible_ldr(ldr: usize) -> bool {
@@ -885,6 +963,61 @@ mod tests {
             let word = (address - self.words.as_ptr() as usize) / 8;
             self.set(word, flink, blink);
         }
+    }
+
+    #[test]
+    fn original_process_peb_module_walk_terminates_after_copy_adoption() {
+        let mut m = Mem::new();
+        let (peb, copied_peb, canonical, public) = (m.addr(0), m.addr(32), m.addr(64), m.addr(96));
+        m.words[3] = canonical;
+        m.words[35] = public;
+        let (a, b) = (m.addr(128), m.addr(160));
+        let (old_head, copy_head) = (canonical + 0x10, public + 0x10);
+        m.set_addr(old_head, a, b);
+        m.set_addr(a, b, old_head);
+        m.set_addr(b, old_head, a);
+        m.set_addr(copy_head, a, b);
+        for offset in [0x20, 0x30] {
+            m.set_addr(canonical + offset, canonical + offset, canonical + offset);
+            m.set_addr(public + offset, canonical + offset, canonical + offset);
+        }
+        assert!(unsafe { adopt_heads(canonical, public, &[&[a, b], &[], &[]]) });
+        let mut nodes = [0; MAX_LIST_NODES];
+        assert_eq!(
+            snapshot_head(peek(copied_peb + 0x18).unwrap() + 0x10, &mut nodes),
+            Some(2)
+        );
+        // The original sentinel is stranded after its neighbours adopt the copy.
+        assert_eq!(
+            snapshot_head(peek(peb + 0x18).unwrap() + 0x10, &mut nodes),
+            None
+        );
+        assert!(publish_process_ldr(peb, canonical, public));
+        assert_eq!(
+            snapshot_head(peek(peb + 0x18).unwrap() + 0x10, &mut nodes),
+            Some(2)
+        );
+        assert_eq!(peek(copied_peb + 0x18), Some(public));
+    }
+
+    #[test]
+    fn process_loader_publication_preserves_an_unexpected_replacement() {
+        let mut m = Mem::new();
+        let (peb, canonical, public, other) = (m.addr(0), m.addr(32), m.addr(64), m.addr(96));
+        m.words[3] = other;
+        assert!(!publish_process_ldr(peb, canonical, public));
+        assert_eq!(m.words[3], other);
+    }
+
+    #[test]
+    fn process_loader_publication_is_idempotent_and_rejects_unreadable_pebs() {
+        let mut m = Mem::new();
+        let (peb, canonical, public) = (m.addr(0), m.addr(32), m.addr(64));
+        m.words[3] = public;
+        assert!(publish_process_ldr(peb, canonical, public));
+        assert_eq!(m.words[3], public);
+        assert!(!publish_process_ldr(0, canonical, public));
+        assert!(!publish_process_ldr(usize::MAX - 8, canonical, public));
     }
 
     #[test]

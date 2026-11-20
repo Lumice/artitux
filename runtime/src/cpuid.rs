@@ -1067,6 +1067,7 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
                 artitux::artifact::CpuidAction::Zero => CpuidOutput::Full(Registers::default()),
                 artitux::artifact::CpuidAction::Query if !artifact_wine_system_rip(rip as u64) => {
                     CpuidOutput::ArtifactQuery(artitux::artifact_profile::reply(
+                        crate::config::artifact_generation(),
                         ACTIVE_IDENTITY.load().vendor(),
                         crate::artifact::intel_identity(),
                         leaf,

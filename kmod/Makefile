@@ -4,8 +4,10 @@ artitux_kmod-y := main.o
 ifneq ($(srctree),)
 HAVE_X86_TASK_FPU := $(shell grep -q 'x86_task_fpu' $(srctree)/arch/x86/include/asm/processor.h 2>/dev/null && echo 1 || echo 0)
 HAVE_FPROBE_FTRACE_REGS := $(shell grep -q 'struct ftrace_regs \*regs' $(srctree)/include/linux/fprobe.h 2>/dev/null && echo 1 || echo 0)
+HAVE_SYSCORE_STRUCT := $(shell grep -q 'struct syscore {' $(srctree)/include/linux/syscore_ops.h 2>/dev/null && echo 1 || echo 0)
 ccflags-y += -DARTITUX_HAVE_X86_TASK_FPU=$(HAVE_X86_TASK_FPU) \
-             -DARTITUX_FPROBE_FTRACE_REGS=$(HAVE_FPROBE_FTRACE_REGS)
+             -DARTITUX_FPROBE_FTRACE_REGS=$(HAVE_FPROBE_FTRACE_REGS) \
+             -DARTITUX_HAVE_SYSCORE_STRUCT=$(HAVE_SYSCORE_STRUCT)
 else
 
 KREL ?= $(shell uname -r)

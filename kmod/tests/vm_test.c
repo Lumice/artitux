@@ -524,6 +524,25 @@ int main(int argc, char **argv)
 	CHECK(WIFEXITED(w2) && WEXITSTATUS(w2) == 0, "xcr0+umip worker failed (status=%d)", w2);
 	CHECK(WIFEXITED(ws) && WEXITSTATUS(ws) == 0, "concurrent AVX-512/PKRU stressor failed (status=%d)", ws);
 
+	/* Test 3: CPU hotplug offline/online cycle while module is loaded */
+	int hpfd = open("/sys/devices/system/cpu/cpu1/online", O_WRONLY);
+	if (hpfd >= 0) {
+		if (write(hpfd, "0\n", 2) == 2) {
+			close(hpfd);
+			hpfd = open("/sys/devices/system/cpu/cpu1/online", O_WRONLY);
+			CHECK(hpfd >= 0 && write(hpfd, "1\n", 2) == 2, "failed to bring cpu1 back online");
+			if (hpfd >= 0)
+				close(hpfd);
+			pin_cpu(1);
+			CHECK(read_xcr0() == host_xcr0, "post-hotplug cpu1 xcr0=0x%llx",
+			      (unsigned long long)read_xcr0());
+			CHECK(try_avx512_insn(), "post-hotplug cpu1 AVX-512 failed");
+			printf("PASS: cpu1 hotplug offline/online cycle\n");
+		} else {
+			close(hpfd);
+		}
+	}
+
 	close(devfd);
 	usleep(250000);
 

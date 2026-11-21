@@ -16,6 +16,7 @@
 
 #include <linux/atomic.h>
 #include <linux/binfmts.h>
+#include <linux/cpuhotplug.h>
 #include <linux/cpumask.h>
 #include <linux/fprobe.h>
 #include <linux/fs.h>
@@ -35,6 +36,7 @@
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/spinlock.h>
+#include <linux/syscore_ops.h>
 #include <linux/tracepoint.h>
 #include <linux/uaccess.h>
 #include <linux/user-return-notifier.h>
@@ -133,6 +135,11 @@ static struct kretprobe krp_umip;
 static bool probe_switch_fpu_reg;
 static bool probe_xstate_prctl_reg;
 static bool probe_umip_reg;
+
+/* CPU hotplug and suspend/resume guards */
+static enum cpuhp_state xcr0_cpuhp_state;
+static bool cpuhp_reg;
+static bool syscore_reg;
 
 /* Read-only diagnostics in /sys/module/artitux_kmod/parameters/ */
 static int param_get_host_xcr0(char *buf, const struct kernel_param *kp)
@@ -438,10 +445,22 @@ static void switch_fpu_on_exit(void)
 {
 	struct cpu_xcr0_state *st = this_cpu_ptr(&cpu_xcr0);
 
-	if (likely(st->task_active) && !st->hw_lowered) {
-		xsetbv(XCR_XFEATURE_ENABLED_MASK, ARTITUX_XCR0_TARGET);
-		st->hw_lowered = true;
-		this_cpu_inc(stat_xcr0_switches);
+	if (likely(st->task_active)) {
+		/*
+		 * restore_fpregs_from_fpstate() inside switch_fpu_return() may
+		 * have re-armed st->urn after fire_user_return_notifiers()
+		 * already ran in arch_exit_work(). Clear it here (IRQs are off)
+		 * so the next fast syscall does not pay a stale URN exit.
+		 */
+		if (unlikely(st->urn_registered)) {
+			user_return_notifier_unregister(&st->urn);
+			st->urn_registered = false;
+		}
+		if (!st->hw_lowered) {
+			xsetbv(XCR_XFEATURE_ENABLED_MASK, ARTITUX_XCR0_TARGET);
+			st->hw_lowered = true;
+			this_cpu_inc(stat_xcr0_switches);
+		}
 	}
 }
 
@@ -476,7 +495,7 @@ static void xstate_prctl_on_exit(long retval, const struct xstate_prctl_data *da
 	    (data->option == ARCH_GET_XCOMP_SUPP || data->option == ARCH_GET_XCOMP_PERM)) {
 		u64 val = ARTITUX_XCR0_TARGET;
 
-		if (put_user(val, (u64 __user *)data->arg2))
+		if (copy_to_user_nofault((u64 __user *)data->arg2, &val, sizeof(val)))
 			pr_debug("artitux_kmod: failed to write masked XCOMP to user\n");
 	}
 }
@@ -526,7 +545,7 @@ static bool decode_umip_dt_addr(struct pt_regs *user_regs, unsigned long *uaddr_
 	if (!user_regs || !user_64bit_mode(user_regs))
 		return false;
 
-	if (copy_from_user(code, (const void __user *)user_regs->ip, sizeof(code)))
+	if (copy_from_user_nofault(code, (const void __user *)user_regs->ip, sizeof(code)))
 		return false;
 
 	while (i < (int)sizeof(code)) {
@@ -661,7 +680,7 @@ static void umip_on_exit(unsigned long retval, const struct umip_probe_data *dat
 	if (retval && data->valid && data->uaddr) {
 		u16 limit = READ_ONCE(umip_dummy_limit);
 
-		if (put_user(limit, (u16 __user *)data->uaddr) == 0)
+		if (copy_to_user_nofault((u16 __user *)data->uaddr, &limit, sizeof(limit)) == 0)
 			this_cpu_inc(stat_umip_fixups);
 	}
 }
@@ -806,16 +825,17 @@ static void tp_on_sched_switch(void *data, bool preempt,
 	st->task_active = next_active;
 
 	/*
-	 * Normally next already has TIF_NEED_FPU_LOAD set (from switch_fpu or
-	 * fpu_clone), so switch_fpu_return() will lower XCR0 on user exit.
-	 * Belt-and-suspenders: if TIF_NEED_FPU_LOAD is somehow clear on next,
-	 * arm user_return_notifier (propagate_user_return_notify moves it to next).
+	 * Always arm user_return_notifier for an active XCR0=7 task (not only
+	 * when TIF_NEED_FPU_LOAD is clear): if @next was preempted mid-way
+	 * through fpu__restore_sig() or similar on another CPU and migrated
+	 * here, TIF_NEED_FPU_LOAD is set now but will be cleared inline before
+	 * arch_exit_work(), bypassing switch_fpu_return().
+	 * propagate_user_return_notify() in __switch_to() transfers the flag
+	 * from @prev to @next.
 	 */
-	if (unlikely(next_active && !test_tsk_thread_flag(next, TIF_NEED_FPU_LOAD))) {
-		if (!st->urn_registered) {
-			user_return_notifier_register(&st->urn);
-			st->urn_registered = true;
-		}
+	if (unlikely(next_active && !st->urn_registered)) {
+		user_return_notifier_register(&st->urn);
+		st->urn_registered = true;
 	}
 }
 
@@ -1029,20 +1049,114 @@ static void find_tracepoints_cb(struct tracepoint *tp, void *priv)
 		tp_sched_free = tp;
 }
 
-/* Kernel FPU functions that require host_xcr0 before executing. */
-static const char *const fpu_restore_syms[] = {
-	"kernel_fpu_begin_mask",
-	"save_fpregs_to_fpstate",
-	"restore_fpregs_from_fpstate",
-	"copy_fpstate_to_sigframe",
-	"fpu__restore_sig",
-	"fpregs_lock_and_load",
-	"fpu_flush_thread",
-	"fpu_swap_kvm_fpstate",
-	"fpu__clear_user_states",
-	"fpregs_mark_activate",
-	"fpu_clone",
-	"fpu_sync_fpstate",
+static void cpu_cleanup_xcr0(void *unused)
+{
+	struct cpu_xcr0_state *st = this_cpu_ptr(&cpu_xcr0);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	st->task_active = false;
+	if (st->urn_registered) {
+		user_return_notifier_unregister(&st->urn);
+		st->urn_registered = false;
+	}
+	if (st->hw_lowered) {
+		xsetbv(XCR_XFEATURE_ENABLED_MASK, host_xcr0);
+		st->hw_lowered = false;
+	}
+	local_irq_restore(flags);
+}
+
+static int xcr0_cpu_online(unsigned int cpu)
+{
+	struct cpu_xcr0_state *st = this_cpu_ptr(&cpu_xcr0);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	st->task_active = false;
+	st->hw_lowered = false;
+	st->urn_registered = false;
+	local_irq_restore(flags);
+	return 0;
+}
+
+static int xcr0_cpu_teardown(unsigned int cpu)
+{
+	cpu_cleanup_xcr0(NULL);
+	return 0;
+}
+
+static int xcr0_syscore_suspend_common(void)
+{
+	struct cpu_xcr0_state *st = this_cpu_ptr(&cpu_xcr0);
+
+	if (st->hw_lowered) {
+		xsetbv(XCR_XFEATURE_ENABLED_MASK, host_xcr0);
+		st->hw_lowered = false;
+	}
+	return 0;
+}
+
+static void xcr0_syscore_resume_common(void)
+{
+	struct cpu_xcr0_state *st = this_cpu_ptr(&cpu_xcr0);
+
+	st->hw_lowered = false;
+	if (st->task_active && !st->urn_registered) {
+		user_return_notifier_register(&st->urn);
+		st->urn_registered = true;
+	}
+}
+
+#if defined(ARTITUX_HAVE_SYSCORE_STRUCT) && ARTITUX_HAVE_SYSCORE_STRUCT
+static int xcr0_syscore_suspend(void *data)
+{
+	return xcr0_syscore_suspend_common();
+}
+
+static void xcr0_syscore_resume(void *data)
+{
+	xcr0_syscore_resume_common();
+}
+
+static const struct syscore_ops xcr0_syscore_ops = {
+	.suspend = xcr0_syscore_suspend,
+	.resume  = xcr0_syscore_resume,
+};
+
+static struct syscore xcr0_syscore = {
+	.ops = &xcr0_syscore_ops,
+};
+#else
+static struct syscore_ops xcr0_syscore_ops = {
+	.suspend = xcr0_syscore_suspend_common,
+	.resume  = xcr0_syscore_resume_common,
+};
+#endif
+
+/*
+ * Kernel FPU functions that require host_xcr0 before executing.
+ * Required symbols must all be ftraceable; if a kernel renames or inlines
+ * one, we fail closed rather than risking an XSAVES/XRSTORS fault.
+ */
+struct fpu_restore_sym {
+	const char *name;
+	bool required;
+};
+
+static const struct fpu_restore_sym fpu_restore_syms[] = {
+	{ "kernel_fpu_begin_mask",       true  },
+	{ "save_fpregs_to_fpstate",      true  },
+	{ "restore_fpregs_from_fpstate", true  },
+	{ "copy_fpstate_to_sigframe",    true  },
+	{ "fpu__restore_sig",            true  },
+	{ "fpregs_lock_and_load",        true  },
+	{ "fpu_flush_thread",            true  },
+	{ "fpu__clear_user_states",      true  },
+	{ "fpu_clone",                   true  },
+	{ "fpu_sync_fpstate",            true  },
+	{ "fpregs_mark_activate",        false },
+	{ "fpu_swap_kvm_fpstate",        false },
 };
 
 static int register_xcr0_hooks(void)
@@ -1057,19 +1171,23 @@ static int register_xcr0_hooks(void)
 	fpu_restore_ops.flags = FTRACE_OPS_FL_RECURSION;
 
 	for (i = 0; i < ARRAY_SIZE(fpu_restore_syms); i++) {
+		const char *sym = fpu_restore_syms[i].name;
+
 		ret = ftrace_set_filter(&fpu_restore_ops,
-					(unsigned char *)fpu_restore_syms[i],
-					strlen(fpu_restore_syms[i]), 0);
+					(unsigned char *)sym,
+					strlen(sym), 0);
 		if (ret) {
-			pr_debug("artitux_kmod: skip non-traceable %s (%d)\n",
-				 fpu_restore_syms[i], ret);
+			if (fpu_restore_syms[i].required) {
+				pr_err("artitux_kmod: required FPU symbol %s is not ftraceable (%d); refusing to enable lazy XCR0=7\n",
+				       sym, ret);
+				ftrace_free_filter(&fpu_restore_ops);
+				return ret;
+			}
+			pr_debug("artitux_kmod: skip optional non-traceable %s (%d)\n",
+				 sym, ret);
 			continue;
 		}
 		added++;
-	}
-	if (!added) {
-		pr_err("artitux_kmod: no FPU restore hook sites found\n");
-		return -ENOENT;
 	}
 
 	ret = register_ftrace_function(&fpu_restore_ops);
@@ -1146,6 +1264,20 @@ static int register_xcr0_hooks(void)
 		return ret;
 	tp_switch_reg = true;
 
+	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "x86/artitux_kmod:online",
+					xcr0_cpu_online, xcr0_cpu_teardown);
+	if (ret < 0)
+		return ret;
+	xcr0_cpuhp_state = ret;
+	cpuhp_reg = true;
+
+#if defined(ARTITUX_HAVE_SYSCORE_STRUCT) && ARTITUX_HAVE_SYSCORE_STRUCT
+	register_syscore(&xcr0_syscore);
+#else
+	register_syscore_ops(&xcr0_syscore_ops);
+#endif
+	syscore_reg = true;
+
 	pr_info("artitux_kmod: lazy XCR0=7 active (host_xcr0=0x%llx, exit=%s, restore_sites=%u)\n",
 		host_xcr0, switch_fpu_sym, added);
 	return 0;
@@ -1181,24 +1313,6 @@ static int register_umip_hook(void)
 	pr_info("artitux_kmod: UMIP SGDT/SIDT fixup ready (dummy_limit=0x%04x, global=%d)\n",
 		umip_dummy_limit, umip_global);
 	return 0;
-}
-
-static void cpu_cleanup_xcr0(void *unused)
-{
-	struct cpu_xcr0_state *st = this_cpu_ptr(&cpu_xcr0);
-	unsigned long flags;
-
-	local_irq_save(flags);
-	st->task_active = false;
-	if (st->urn_registered) {
-		user_return_notifier_unregister(&st->urn);
-		st->urn_registered = false;
-	}
-	if (st->hw_lowered) {
-		xsetbv(XCR_XFEATURE_ENABLED_MASK, host_xcr0);
-		st->hw_lowered = false;
-	}
-	local_irq_restore(flags);
 }
 
 static void cleanup_all(void)
@@ -1255,6 +1369,20 @@ static void cleanup_all(void)
 		unregister_ftrace_function(&fpu_restore_ops);
 		ftrace_free_filter(&fpu_restore_ops);
 		fpu_restore_reg = false;
+	}
+
+	if (syscore_reg) {
+#if defined(ARTITUX_HAVE_SYSCORE_STRUCT) && ARTITUX_HAVE_SYSCORE_STRUCT
+		unregister_syscore(&xcr0_syscore);
+#else
+		unregister_syscore_ops(&xcr0_syscore_ops);
+#endif
+		syscore_reg = false;
+	}
+
+	if (cpuhp_reg) {
+		cpuhp_remove_state_nocalls(xcr0_cpuhp_state);
+		cpuhp_reg = false;
 	}
 
 	if (xcr0_hook_active) {
@@ -1365,5 +1493,5 @@ module_exit(artitux_kmod_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Lumice <89531268+Lumice@users.noreply.github.com>");
-MODULE_VERSION("0.1.0");
+MODULE_VERSION("0.1.2");
 MODULE_DESCRIPTION("Per-process lazy XCR0=7 and UMIP SGDT/SIDT fixup for Artitux");

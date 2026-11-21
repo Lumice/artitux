@@ -10,14 +10,16 @@ Per-process `XCR0 = 0x7` and UMIP (`SGDT`/`SIDT` limit) DKMS kernel module for A
   - `xcr0` (`ARTITUX_FLAG_XCR0_7`): switches userspace `XCR0` to `0x7` lazily on the kernel FPU lifecycle (`sched_switch`, `kernel_fpu_begin_mask`, `XSAVE`/`XRSTOR` paths, `switch_fpu_return`, and `user_return_notifier`).
 - Unloads cleanly (`modprobe -r artitux_kmod`) once no tracked processes remain.
 
-## Build & test
+## Build, install & test
 
 ```sh
 make -C kmod all
 make -C kmod vm-test
+sudo make -C kmod install-dkms
+sudo make -C kmod uninstall-dkms
 ```
 
-`make vm-test` boots `/boot/vmlinuz-$(uname -r)` in a disposable QEMU/KVM guest (`-cpu host -smp 4`) to verify UMIP, `XCR0 = 0x7`, signals, `ptrace`, threads/forks, concurrent AVX-512/PKRU, and module unload/reload.
+`make vm-test` boots `/boot/vmlinuz-$(uname -r)` in a disposable QEMU/KVM guest (`-cpu host -smp 4`) to verify UMIP, `XCR0 = 0x7`, 64-bit and ia32 signals/sigreturn, `ptrace`, threads/forks, concurrent AVX-512/PKRU, and module unload/reload. `install-dkms` handles both first-time installation and upgrades from earlier versions.
 
 ## Interface & parameters
 

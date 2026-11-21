@@ -351,7 +351,25 @@ static int run_xcr0_worker(uint64_t host_xcr0)
 		CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "fork child %d failed (status=%d)", i, st);
 	}
 
-	printf("PASS: xcr0+umip worker (xsave/ptrace/sigalrm/threads/forks/lazy-syscall passed)\n");
+	/* 32-bit (ia32) legacy sigreturn + rt_sigreturn regression check */
+	pid_t p32 = fork();
+	if (p32 == 0) {
+		char *a[] = { "/ia32_sig_test", NULL };
+		execv("/ia32_sig_test", a);
+		_exit(errno == ENOEXEC ? 126 : 127);
+	}
+	int st32 = 0;
+	waitpid(p32, &st32, 0);
+	if (WIFEXITED(st32) && WEXITSTATUS(st32) == 126) {
+		printf("INFO: ia32 sigreturn test skipped (IA32_EMULATION disabled)\n");
+	} else {
+		CHECK(WIFEXITED(st32) && WEXITSTATUS(st32) == 0,
+		      "ia32 sigreturn test failed (status=0x%x, exit=%d, sig=%d)",
+		      st32, WIFEXITED(st32) ? WEXITSTATUS(st32) : -1,
+		      WIFSIGNALED(st32) ? WTERMSIG(st32) : 0);
+	}
+
+	printf("PASS: xcr0+umip worker (xsave/ptrace/sigalrm/ia32-sigreturn/threads/forks/lazy-syscall passed)\n");
 	return failures ? 1 : 0;
 }
 

@@ -24,8 +24,11 @@ trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/root"
 gcc -static -O2 -Wall -Wextra -pthread "$TEST_DIR/vm_test.c" -o "$TMP/root/init"
+gcc -m32 -nostdlib -static -fno-pie -no-pie -ffreestanding \
+    -fno-stack-protector -fno-asynchronous-unwind-tables \
+    -O2 -Wall -Wextra "$TEST_DIR/ia32_sig_test.c" -o "$TMP/root/ia32_sig_test"
 cp "$KO" "$TMP/root/artitux_kmod.ko"
-chmod +x "$TMP/root/init"
+chmod +x "$TMP/root/init" "$TMP/root/ia32_sig_test"
 
 (cd "$TMP/root" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -1 > "$TMP/initramfs.cpio.gz")
 

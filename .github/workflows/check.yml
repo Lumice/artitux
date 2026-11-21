@@ -30,3 +30,21 @@ jobs:
       # cannot emulate; Miri covers the same feature set it did upstream.
       - run: cargo +nightly miri test -p artitux-runtime --lib --no-default-features --features cpuid,hooks,reflex,syscall,kuser,faketime,gamescope,debug,environment
       - run: cargo +nightly miri test -p artitux-rust
+  kmod:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure kernel headers
+        run: |
+          if [ ! -d "/lib/modules/$(uname -r)/build" ]; then
+            sudo apt-get update
+            sudo apt-get install -y "linux-headers-$(uname -r)"
+          fi
+      - name: Build artitux_kmod, CLI, and VM test binaries
+        run: |
+          make -C kmod all
+          make -C kmod cli
+          gcc -O2 -Wall -Wextra -pthread kmod/tests/vm_test.c -o /tmp/vm_test
+          gcc -m32 -nostdlib -static -fno-pie -no-pie -ffreestanding \
+            -fno-stack-protector -fno-asynchronous-unwind-tables \
+            -O2 -Wall -Wextra kmod/tests/ia32_sig_test.c -o /tmp/ia32_sig_test

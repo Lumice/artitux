@@ -43,19 +43,21 @@ normally with `modprobe -r artitux_kmod` when no tracked games are running.
    make -C kmod vm-test
    ```
 
-3. Install via DKMS (signs automatically if DKMS MOK signing is configured for
-   Secure Boot) and enable loading at boot:
+3. Install (or upgrade) via DKMS and enable loading at boot (signs
+   automatically if DKMS MOK signing is configured for Secure Boot):
 
    ```sh
-   sudo mkdir -p /usr/src/artitux-kmod-0.1.0
-   sudo cp -a kmod/artitux_kmod.h kmod/main.c kmod/Makefile kmod/dkms.conf /usr/src/artitux-kmod-0.1.0/
-   sudo dkms add -m artitux-kmod -v 0.1.0
-   sudo dkms install -m artitux-kmod -v 0.1.0 -k "$(uname -r)"
-   sudo install -m 0644 kmod/modules-load.d/artitux.conf /etc/modules-load.d/artitux.conf
-   sudo modprobe artitux_kmod
+   sudo make -C kmod install-dkms
    ```
 
-4. Check readiness:
+   To remove the module later:
+
+   ```sh
+   sudo make -C kmod uninstall-dkms
+   ```
+
+4. If you installed Artitux before `v1.1.1`, re-run `install.sh` so your
+   `artitux` launcher knows how to arm `/dev/artitux`. Then check readiness:
 
    ```sh
    ~/.local/bin/artitux --check

@@ -24,10 +24,6 @@ Artitux includes a DKMS kernel module in [kmod/](../kmod/README.md) that sets
 games and the rest of the system keep full AVX-512 and PKU. It can be unloaded
 normally with `modprobe -r artitux_kmod` when no tracked games are running.
 
-> [!NOTE]
-> If you previously loaded `pingu_policy`, disable it and reboot before loading
-> `artitux_kmod`. Both modules manage `XCR0` and cannot run together.
-
 1. Install your kernel headers and DKMS (and QEMU/KVM if you want to run the
    optional VM check), then clone this repository:
 

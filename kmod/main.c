@@ -51,6 +51,13 @@
 #include "artitux_kmod.h"
 
 #define ARTITUX_XCR0_TARGET 7ULL
+/*
+ * UABI features kept in user_xfeatures. PKRU must stay: with OSPKE the
+ * kernel always sets XFEATURE_MASK_PKRU in the signal frame header
+ * (update_pkru_in_sigframe), and the ia32 sigreturn path rejects any
+ * header bit outside user_xfeatures (validate_user_xstate_header).
+ */
+#define ARTITUX_USER_XFEATURES (ARTITUX_XCR0_TARGET | XFEATURE_MASK_PKRU)
 #define POLICY_HASH_BITS    10
 #define POLICY_HASH_SIZE    (1U << POLICY_HASH_BITS)
 
@@ -214,9 +221,9 @@ static void restrict_task_fpu_state(struct task_struct *task)
 	struct fpu *fpu = artitux_task_fpu(task);
 
 	if (fpu && fpu->fpstate)
-		fpu->fpstate->user_xfeatures &= ARTITUX_XCR0_TARGET;
+		fpu->fpstate->user_xfeatures &= ARTITUX_USER_XFEATURES;
 	if (fpu)
-		fpu->perm.__state_perm &= ARTITUX_XCR0_TARGET;
+		fpu->perm.__state_perm &= ARTITUX_USER_XFEATURES;
 }
 
 static void policy_node_free_rcu(struct rcu_head *head)

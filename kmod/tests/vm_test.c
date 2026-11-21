@@ -200,7 +200,7 @@ static int run_umip_only_worker(uint64_t host_xcr0)
 	uint16_t lim3 = read_sidt_stack();
 	CHECK(lim1 == 0x007f, "umip-only sgdt(stack) limit=0x%04x expected 0x007f", lim1);
 	CHECK(lim2 == 0x007f, "umip-only sgdt(rip) limit=0x%04x expected 0x007f", lim2);
-	CHECK(lim3 == 0x007f, "umip-only sidt(stack) limit=0x%04x expected 0x007f", lim3);
+	CHECK(lim3 == 0x0fff, "umip-only sidt(stack) limit=0x%04x expected 0x0fff", lim3);
 
 	printf("PASS: umip-only worker (xcr0=0x%llx, sgdt=0x%04x/0x%04x, sidt=0x%04x)\n",
 	       (unsigned long long)x, lim1, lim2, lim3);

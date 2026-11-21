@@ -70,7 +70,11 @@ MODULE_PARM_DESC(umip_global, "Apply UMIP SGDT/SIDT dummy_limit systemwide (defa
 
 static unsigned short umip_dummy_limit = 0x007F;
 module_param(umip_dummy_limit, ushort, 0644);
-MODULE_PARM_DESC(umip_dummy_limit, "16-bit descriptor table limit written for SGDT/SIDT under UMIP (default: 0x007F)");
+MODULE_PARM_DESC(umip_dummy_limit, "16-bit GDT limit written for SGDT under UMIP (default: 0x007F)");
+
+static unsigned short umip_idt_limit = 0x0FFF;
+module_param(umip_idt_limit, ushort, 0644);
+MODULE_PARM_DESC(umip_idt_limit, "16-bit IDT limit written for SIDT under UMIP (default: 0x0FFF)");
 
 /* Runtime state */
 static u64 host_xcr0;
@@ -504,6 +508,7 @@ static void xstate_prctl_on_exit(long retval, const struct xstate_prctl_data *da
 
 struct umip_probe_data {
 	unsigned long uaddr;
+	bool is_idt;
 	bool valid;
 };
 
@@ -531,7 +536,8 @@ static unsigned long pt_reg_by_idx(const struct pt_regs *regs, int idx)
 }
 
 /* Decode 64-bit SGDT (0F 01 /0) or SIDT (0F 01 /1) effective user address. */
-static bool decode_umip_dt_addr(struct pt_regs *user_regs, unsigned long *uaddr_out)
+static bool decode_umip_dt_addr(struct pt_regs *user_regs, unsigned long *uaddr_out,
+				bool *is_idt_out)
 {
 	unsigned char code[15];
 	int i = 0;
@@ -656,19 +662,21 @@ have_ea:
 	}
 
 	*uaddr_out = uaddr;
+	*is_idt_out = (reg == 1);
 	return true;
 }
 
 static int umip_on_entry(struct pt_regs *user_regs, struct umip_probe_data *data)
 {
 	data->valid = false;
+	data->is_idt = false;
 	data->uaddr = 0;
 
 	if (!READ_ONCE(umip_global) &&
 	    !(lookup_task_active_flags(current) & ARTITUX_FLAG_UMIP))
 		return 1;
 
-	if (!decode_umip_dt_addr(user_regs, &data->uaddr))
+	if (!decode_umip_dt_addr(user_regs, &data->uaddr, &data->is_idt))
 		return 1;
 
 	data->valid = true;
@@ -677,8 +685,10 @@ static int umip_on_entry(struct pt_regs *user_regs, struct umip_probe_data *data
 
 static void umip_on_exit(unsigned long retval, const struct umip_probe_data *data)
 {
-	if (retval && data->valid && data->uaddr) {
-		u16 limit = READ_ONCE(umip_dummy_limit);
+	/* fixup_umip_exception() returns bool: only the low byte is defined. */
+	if ((u8)retval && data->valid && data->uaddr) {
+		u16 limit = data->is_idt ? READ_ONCE(umip_idt_limit) :
+					   READ_ONCE(umip_dummy_limit);
 
 		if (copy_to_user_nofault((u16 __user *)data->uaddr, &limit, sizeof(limit)) == 0)
 			this_cpu_inc(stat_umip_fixups);
@@ -1310,8 +1320,8 @@ static int register_umip_hook(void)
 	probe_umip_reg = true;
 	umip_hook_active = true;
 	host_capabilities |= ARTITUX_CAP_UMIP_HOOK;
-	pr_info("artitux_kmod: UMIP SGDT/SIDT fixup ready (dummy_limit=0x%04x, global=%d)\n",
-		umip_dummy_limit, umip_global);
+	pr_info("artitux_kmod: UMIP SGDT/SIDT fixup ready (gdt_limit=0x%04x, idt_limit=0x%04x, global=%d)\n",
+		umip_dummy_limit, umip_idt_limit, umip_global);
 	return 0;
 }
 
@@ -1493,5 +1503,5 @@ module_exit(artitux_kmod_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Lumice <89531268+Lumice@users.noreply.github.com>");
-MODULE_VERSION("0.1.2");
+MODULE_VERSION("0.1.3");
 MODULE_DESCRIPTION("Per-process lazy XCR0=7 and UMIP SGDT/SIDT fixup for Artitux");

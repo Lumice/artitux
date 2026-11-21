@@ -2,8 +2,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::reflex::SyscallRoute;
-
 pub const SYSCALL_BYPASS_MAGIC: u64 = 0x6969_6969_6969_6969;
 /// Bypass value used by the Artifact build in Anno 117 (the Reflex value).
 pub const SYSCALL_BYPASS_MAGIC_1337: u64 = 0x1337_1337_1337_1337;
@@ -102,16 +100,13 @@ impl State {
         self.target_pid.load(Ordering::Acquire) != 0
     }
 
-    pub fn route_syscall(&self) -> Option<SyscallRoute> {
+    pub fn route_syscall(&self) -> Option<u64> {
         if !self.has_target_process() {
             return None;
         }
         let target = self.callback.load(Ordering::Acquire);
         // `has_target_process` above already requires a registered PID.
-        (target != 0).then_some(SyscallRoute {
-            target,
-            rax_is_resume: true,
-        })
+        (target != 0).then_some(target)
     }
 
     /// The child has no provider worker and must register its own session.
@@ -147,12 +142,11 @@ mod tests {
             state.cpuid(0x336933, 0x6ffffa761000, 0, false),
             CpuidAction::Native
         );
-        let route = state.route_syscall().expect("registered ART callback");
-        assert_eq!(route.target, 0x6ffffa761000);
-        assert!(route.rax_is_resume);
+        let target = state.route_syscall().expect("registered ART callback");
+        assert_eq!(target, 0x6ffffa761000);
         state.cpuid(0x1337, 0, 0x999, true);
         state.cpuid(0x336933, 0x6ffffa762000, 0, true);
-        assert_eq!(state.route_syscall().unwrap().target, 0x6ffffa761000);
+        assert_eq!(state.route_syscall(), Some(0x6ffffa761000));
     }
 
     #[test]
@@ -206,10 +200,10 @@ mod order_tests {
         );
         assert!(state.route_syscall().is_none());
         state.cpuid(0x1337, 0, 0x174, false);
-        assert_eq!(state.route_syscall().unwrap().target, 0x6ffffa761000);
+        assert_eq!(state.route_syscall(), Some(0x6ffffa761000));
         assert_eq!(state.cpuid(0x1338, 0, 0, true), CpuidAction::Ready);
         state.cpuid_from(0x336933, 0x6ffffa762000, 0, false, true);
-        assert_eq!(state.route_syscall().unwrap().target, 0x6ffffa761000);
+        assert_eq!(state.route_syscall(), Some(0x6ffffa761000));
     }
 
     #[test]
@@ -219,7 +213,7 @@ mod order_tests {
         state.cpuid(0x1337, 0, 0x174, false);
         assert!(state.route_syscall().is_none());
         state.cpuid(0x336933, 0x6ffffa761000, 0, false);
-        assert_eq!(state.route_syscall().unwrap().target, 0x6ffffa761000);
+        assert_eq!(state.route_syscall(), Some(0x6ffffa761000));
     }
 
     #[test]
@@ -231,7 +225,7 @@ mod order_tests {
         assert!(state.route_syscall().is_none());
         assert_eq!(state.cpuid(0x1338, 0, 0, true), CpuidAction::Native);
         state.cpuid(0x1337, 0, 0x174, false);
-        assert_eq!(state.route_syscall().unwrap().target, 0x6ffffa761000);
+        assert_eq!(state.route_syscall(), Some(0x6ffffa761000));
     }
 
     #[test]

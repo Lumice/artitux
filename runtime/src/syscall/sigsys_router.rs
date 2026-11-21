@@ -1,21 +1,19 @@
-//! The SIGSYS boundary: Artitux's own syscall-trap handler, installed by
-//! `hooks.rs` alongside the CPUID SIGSEGV handler. Given a trapped syscall,
-//! this forwards ordinary calls to Wine, routes Reflex-evidenced calls to
-//! Reflex, and routes positively registered ART SYS_USER_DISPATCH calls to
-//! ART's callback. Each protocol has its own bypass and register contract.
-//!
-//! This module is always compiled, independent of the `kuser`/`reflex`
-//! features: without a matching registration or bridge, calls fall through
-//! to Wine. The marker bookkeeping this boundary reads
-//! ([`super::reflex_markers`]) lives in its own file because it needs that
-//! narrower feature gate; this file owns the decision, not the storage.
+//! The SIGSYS boundary: Artitux's syscall-trap handler, installed by
+//! `hooks.rs` alongside the CPUID SIGSEGV handler. Routes positively
+//! registered Artifact `SYS_USER_DISPATCH` calls to Artifact's callback,
+//! repairs leaked Windows syscalls trapped by `artifact_seccomp`, and
+//! forwards everything else to Wine.
 
-use artitux::reflex::SYSCALL_BYPASS_MAGIC;
 use core::ffi::{c_int, c_void};
+#[cfg(feature = "artifact")]
 use core::ptr;
-use libc::{siginfo_t, ucontext_t};
+use libc::siginfo_t;
+#[cfg(feature = "artifact")]
+use libc::ucontext_t;
 
+#[cfg(feature = "artifact")]
 const SYS_SECCOMP: c_int = 1;
+#[cfg(feature = "artifact")]
 const SYS_USER_DISPATCH: c_int = 2;
 
 #[cfg(feature = "artifact")]
@@ -63,86 +61,8 @@ unsafe fn publish_artifact_sse(state: &ArtifactFpState) {
     }
 }
 
-#[cfg(feature = "debug")]
-unsafe extern "C" {
-    fn debug_log(message: *const core::ffi::c_char);
-    fn debug_log_hex(prefix: *const core::ffi::c_char, value: u64);
-}
-
-/// Bounded trace of Reflex selector routing: the syscall number, thread and
-/// caller for each SIGSYS offered to Reflex, and for each bypass replay Reflex
-/// hands back. A selector route with no following bypass on the same thread
-/// was answered by Reflex itself; one followed by a bypass went to Wine.
-#[cfg(feature = "debug")]
-fn trace_reflex_hop(
-    kind: &'static core::ffi::CStr,
-    tid: u64,
-    rip: u64,
-    gregs: *const libc::greg_t,
-) {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    static EVENTS: AtomicU64 = AtomicU64::new(0);
-    if EVENTS.fetch_add(1, Ordering::Relaxed) >= 96 {
-        return;
-    }
-    let register = |index: libc::c_int| unsafe { gregs.add(index as usize).read() as u64 };
-    unsafe {
-        debug_log(kind.as_ptr());
-        debug_log_hex(c"reflex hop tid=".as_ptr(), tid);
-        debug_log_hex(c"reflex hop RIP=".as_ptr(), rip);
-        debug_log_hex(c"reflex hop RAX=".as_ptr(), register(libc::REG_RAX));
-        debug_log_hex(c"reflex hop R10=".as_ptr(), register(libc::REG_R10));
-        debug_log_hex(c"reflex hop RDX=".as_ptr(), register(libc::REG_RDX));
-        debug_log_hex(c"reflex hop R8=".as_ptr(), register(libc::REG_R8));
-    }
-}
-
-/// Keep a separate, small budget for the window-list service: the general
-/// Reflex trace is usually exhausted before game initialization reaches it.
-/// The seventh and eighth Windows arguments live on the caller's stack.
-#[cfg(all(feature = "debug", feature = "kuser", feature = "reflex"))]
-fn trace_window_list(kind: &'static core::ffi::CStr, gregs: *const libc::greg_t) {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    static EVENTS: AtomicU64 = AtomicU64::new(0);
-    let register = |index: libc::c_int| unsafe { gregs.add(index as usize).read() as u64 };
-    if register(libc::REG_RAX) != 0x132d || EVENTS.fetch_add(1, Ordering::Relaxed) >= 16 {
-        return;
-    }
-    let rsp = register(libc::REG_RSP);
-    unsafe {
-        debug_log(kind.as_ptr());
-        debug_log_hex(c"window list RIP=".as_ptr(), register(libc::REG_RIP));
-        debug_log_hex(c"window list RSP=".as_ptr(), rsp);
-        debug_log_hex(c"window list R10=".as_ptr(), register(libc::REG_R10));
-        debug_log_hex(c"window list RDX=".as_ptr(), register(libc::REG_RDX));
-        debug_log_hex(c"window list R8=".as_ptr(), register(libc::REG_R8));
-        debug_log_hex(c"window list R9=".as_ptr(), register(libc::REG_R9));
-        if let Some(value) = crate::procmem::read_u64(rsp.saturating_add(0x38)) {
-            debug_log_hex(c"window list stack+0x38=".as_ptr(), value);
-        }
-        if let Some(value) = crate::procmem::read_u64(rsp.saturating_add(0x40)) {
-            debug_log_hex(c"window list stack+0x40=".as_ptr(), value);
-        }
-    }
-}
-
 unsafe extern "C" {
     fn forward_signal(sig: c_int, info: *mut siginfo_t, context: *mut c_void);
-    fn reflex_route_syscall(
-        context: *const ucontext_t,
-        target: *mut u64,
-        rax_is_resume: *mut c_int,
-    ) -> c_int;
-}
-
-#[derive(Clone, Copy)]
-struct Route {
-    target: u64,
-    rax_is_resume: bool,
-}
-
-fn is_bypass(xmm5: &[u8; 16]) -> bool {
-    u64::from_le_bytes(xmm5[..8].try_into().unwrap()) == SYSCALL_BYPASS_MAGIC
 }
 
 #[unsafe(no_mangle)]
@@ -151,9 +71,9 @@ pub unsafe extern "C" fn syscallhook(sig: c_int, info: *mut siginfo_t, context: 
     let handled = if info.is_null() || context.is_null() {
         false
     } else {
+        #[cfg(feature = "artifact")]
         unsafe {
             let context = context.cast::<ucontext_t>();
-            #[cfg(feature = "artifact")]
             match ptr::addr_of!((*info).si_code).read() {
                 SYS_USER_DISPATCH => crate::artifact_seccomp::note_dispatch_trap(),
                 // A Windows syscall that leaked past dispatch: rewind it so
@@ -162,44 +82,37 @@ pub unsafe extern "C" fn syscallhook(sig: c_int, info: *mut siginfo_t, context: 
                 SYS_SECCOMP if crate::artifact_seccomp::repair_leak(context) => return,
                 _ => {}
             }
-            #[cfg(feature = "artifact")]
             let _dispatch_guard = crate::artifact::wine_dispatch_guard();
-            #[cfg(feature = "artifact")]
             let artifact_target = if crate::artifact::active() {
                 crate::artifact::syscall_target()
             } else {
                 None
             };
-            #[cfg(not(feature = "artifact"))]
-            let artifact_target = None;
             // Artifact is active and this Wine uses dispatch: arm the trap.
-            #[cfg(feature = "artifact")]
             if artifact_target.is_some()
                 && ptr::addr_of!((*info).si_code).read() == SYS_USER_DISPATCH
             {
                 let _ = crate::artifact_seccomp::install_once();
             }
-            redirect(info, context, artifact_target, |ctx| {
-                let mut target = 0;
-                let mut rax_is_resume = 0;
-                (reflex_route_syscall(ctx, &mut target, &mut rax_is_resume) != 0).then_some(Route {
-                    target,
-                    rax_is_resume: rax_is_resume != 0,
-                })
-            })
+            redirect(info, context, artifact_target)
         }
+        #[cfg(not(feature = "artifact"))]
+        false
     };
     if !handled {
         unsafe { forward_signal(sig, info, context) };
     }
 }
 
+#[cfg(feature = "artifact")]
 unsafe fn redirect(
     info: *const siginfo_t,
     context: *mut ucontext_t,
     artifact_target: Option<u64>,
-    route: impl FnOnce(*const ucontext_t) -> Option<Route>,
 ) -> bool {
+    let Some(target) = artifact_target else {
+        return false;
+    };
     if info.is_null() || context.is_null() {
         return false;
     }
@@ -208,323 +121,72 @@ unsafe fn redirect(
         return false;
     }
     let code = unsafe { ptr::addr_of!((*info).si_code).read() };
-    if !matches!(code, SYS_SECCOMP | SYS_USER_DISPATCH) {
+    // ART's contract covers SUD only.
+    if code != SYS_USER_DISPATCH {
         return false;
     }
-    // ART's contract covers SUD only. In particular, seccomp traps must not
-    // consume an ART bridge marker or enter Reflex's unrelated magic path.
-    #[cfg(feature = "artifact")]
-    if artifact_target.is_some() && code != SYS_USER_DISPATCH {
+    // Refuse malformed extended metadata before changing any registers.
+    // Old-style FXSAVE needs no header write.
+    let Some(artifact_fpstate) = (unsafe { artifact_fp_state(fpregs) }) else {
         return false;
-    }
-    #[cfg(feature = "artifact")]
-    let artifact_fpstate = if artifact_target.is_some() {
-        // Refuse malformed extended metadata before changing any registers or
-        // consuming a pending marker. Old-style FXSAVE needs no header write.
-        let Some(state) = (unsafe { artifact_fp_state(fpregs) }) else {
-            return false;
-        };
-        state
-    } else {
-        ArtifactFpState::Legacy
     };
     let xmm = unsafe { ptr::addr_of_mut!((*fpregs)._xmm).cast::<[u8; 16]>() };
     let xmm5 = unsafe { xmm.add(5).read() };
     let gregs = unsafe { ptr::addr_of_mut!((*context).uc_mcontext.gregs).cast::<libc::greg_t>() };
     let rip = unsafe { gregs.add(libc::REG_RIP as usize).read() as u64 };
-    // Every branch below needs the current thread id at least once, and some
-    // need it two or three times; `gettid` is a real syscall (not the cached
-    // libc wrapper), so query it once per event rather than per use.
-    let tid = unsafe { libc::gettid() as u64 };
-    // Every use below is gated by some combination of `kuser`/`reflex`/
-    // `debug`; with all three off, `tid` itself would otherwise be unused.
-    let _ = tid;
-    #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
-    let trace_event = {
-        let register = |index: libc::c_int| unsafe { gregs.add(index as usize).read() as u64 };
-        super::diagnostics::event(
-            tid,
-            code as u64,
-            super::diagnostics::Disposition::Forwarded,
-            [
-                rip,
-                register(libc::REG_RSP),
-                register(libc::REG_RAX),
-                register(libc::REG_R10),
-                register(libc::REG_RCX),
-                register(libc::REG_RDX),
-                register(libc::REG_R8),
-                register(libc::REG_R9),
-                register(libc::REG_R13),
-                u64::from_le_bytes(xmm5[..8].try_into().unwrap()),
-            ],
-        )
-    };
-    // `bridged` only exists under kuser+reflex (its type, `reflex_markers::
-    // Phase`, is only compiled then) — every read of it below is gated by
-    // the same features, so it is simply not declared otherwise, rather
-    // than given a placeholder `None` with no type for the compiler to
-    // infer from unused dead code.
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    let bridged = super::reflex_markers::consume(
-        tid,
-        unsafe { gregs.add(libc::REG_RSP as usize).read() as u64 },
+    let rsp = unsafe { gregs.add(libc::REG_RSP as usize).read() as u64 };
+    let bypass =
+        crate::artifact::is_syscall_bypass(u64::from_le_bytes(xmm5[..8].try_into().unwrap()));
+    let service = unsafe { gregs.add(libc::REG_RAX as usize).read() as u32 };
+    let mut xmm4 = [0u8; 16];
+    xmm4[..4].copy_from_slice(&service.to_le_bytes());
+    unsafe { xmm.add(4).write(xmm4) };
+    unsafe { publish_artifact_sse(&artifact_fpstate) };
+
+    if bypass {
+        if let Some(saved) = super::artifact_flags::bypass(rsp, rip) {
+            unsafe {
+                gregs
+                    .add(libc::REG_R11 as usize)
+                    .write(saved.r11 as libc::greg_t);
+                gregs
+                    .add(libc::REG_EFL as usize)
+                    .write(saved.eflags as libc::greg_t);
+            }
+        }
+        unsafe {
+            xmm.add(5).write([0; 16]);
+            gregs
+                .add(libc::REG_RAX as usize)
+                .write(libc::greg_t::from(service));
+        }
+        return false;
+    }
+
+    super::artifact_flags::route(
+        rsp,
         rip,
-        unsafe { xmm.add(4).read() },
-        xmm5,
         unsafe { gregs.add(libc::REG_R11 as usize).read() as u64 },
         unsafe { gregs.add(libc::REG_EFL as usize).read() as u64 },
     );
-    #[cfg(feature = "artifact")]
-    if code == SYS_USER_DISPATCH
-        && let Some(target) = artifact_target
-    {
-        let rsp = unsafe { gregs.add(libc::REG_RSP as usize).read() as u64 };
-        let bypass =
-            crate::artifact::is_syscall_bypass(u64::from_le_bytes(xmm5[..8].try_into().unwrap()));
-        let service = unsafe { gregs.add(libc::REG_RAX as usize).read() as u32 };
-        let mut xmm4 = [0u8; 16];
-        xmm4[..4].copy_from_slice(&service.to_le_bytes());
-        unsafe { xmm.add(4).write(xmm4) };
-        unsafe { publish_artifact_sse(&artifact_fpstate) };
 
-        if bypass {
-            let mut saved_flags =
-                super::artifact_flags::bypass(rsp, rip).map(|saved| (saved.r11, saved.eflags));
-            #[cfg(all(feature = "kuser", feature = "reflex"))]
-            {
-                match bridged {
-                    Some(super::reflex_markers::Phase::Replay(saved)) => {
-                        if saved_flags.is_none() {
-                            saved_flags = Some((saved.r11, saved.eflags));
-                        }
-                    }
-                    Some(super::reflex_markers::Phase::Route) => {
-                        super::reflex_markers::cancel(tid, rsp, rip);
-                    }
-                    None => {}
-                }
-                super::reflex_markers::retire_markers(tid, rsp);
-            }
-            if let Some((r11, eflags)) = saved_flags {
-                unsafe {
-                    gregs.add(libc::REG_R11 as usize).write(r11 as libc::greg_t);
-                    gregs
-                        .add(libc::REG_EFL as usize)
-                        .write(eflags as libc::greg_t);
-                }
-            }
-            unsafe {
-                xmm.add(5).write([0; 16]);
-                gregs
-                    .add(libc::REG_RAX as usize)
-                    .write(libc::greg_t::from(service));
-            }
-            return false;
-        }
-
-        super::artifact_flags::route(
-            rsp,
-            rip,
-            unsafe { gregs.add(libc::REG_R11 as usize).read() as u64 },
-            unsafe { gregs.add(libc::REG_EFL as usize).read() as u64 },
-        );
-
-        #[cfg(all(feature = "kuser", feature = "reflex"))]
-        match bridged {
-            Some(super::reflex_markers::Phase::Route) => {}
-            Some(super::reflex_markers::Phase::Replay(_)) => {
-                // A handler may complete without bypassing. A later call can
-                // reuse the same RIP and RSP, so Replay is not proof of a
-                // bypass. Save this new call's flags for its own replay.
-                super::reflex_markers::retire_markers(tid, rsp);
-                if super::reflex_markers::remember_marker(tid, rsp, rip) {
-                    let _ = super::reflex_markers::consume(
-                        tid,
-                        rsp,
-                        rip,
-                        xmm4,
-                        xmm5,
-                        unsafe { gregs.add(libc::REG_R11 as usize).read() as u64 },
-                        unsafe { gregs.add(libc::REG_EFL as usize).read() as u64 },
-                    );
-                }
-            }
-            None => super::reflex_markers::retire_markers(tid, rsp),
-        }
-
-        unsafe {
-            let r11 = gregs.add(libc::REG_R11 as usize).read();
-            gregs.add(libc::REG_EFL as usize).write(r11);
-            gregs.add(libc::REG_RAX as usize).write(rip as libc::greg_t);
-            gregs
-                .add(libc::REG_RCX as usize)
-                .write(target as libc::greg_t);
-            gregs
-                .add(libc::REG_RIP as usize)
-                .write(target as libc::greg_t);
-        }
-        return true;
-    }
-    #[cfg(not(feature = "artifact"))]
-    let _ = artifact_target;
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    if let Some(super::reflex_markers::Phase::Replay(saved)) = bridged {
-        unsafe {
-            xmm.add(4).write(saved.xmm4);
-            xmm.add(5).write(saved.xmm5);
-            gregs
-                .add(libc::REG_R11 as usize)
-                .write(saved.r11 as libc::greg_t);
-            gregs
-                .add(libc::REG_EFL as usize)
-                .write(saved.eflags as libc::greg_t);
-        }
-        #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
-        super::diagnostics::record_game_event(
-            trace_event.with_disposition(super::diagnostics::Disposition::BridgeReplayRestored),
-        );
-        return false;
-    }
-    if is_bypass(&xmm5) {
-        #[cfg(all(feature = "debug", feature = "kuser", feature = "reflex"))]
-        trace_window_list(c"window list Reflex bypass", gregs);
-        #[cfg(feature = "debug")]
-        trace_reflex_hop(c"reflex bypass replay", tid, rip, gregs);
-        #[cfg(all(feature = "kuser", feature = "reflex"))]
-        if matches!(bridged, Some(super::reflex_markers::Phase::Route)) {
-            unsafe {
-                super::reflex_markers::cancel(
-                    tid,
-                    gregs.add(libc::REG_RSP as usize).read() as u64,
-                    rip,
-                );
-            }
-        }
-        unsafe { xmm.add(5).write([0; 16]) };
-        #[cfg(all(feature = "kuser", feature = "reflex"))]
-        if code == SYS_USER_DISPATCH && super::win32u_zero_list::maybe_complete_bypass(gregs) {
-            #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
-            super::diagnostics::record_game_event(
-                trace_event.with_disposition(super::diagnostics::Disposition::LocallyCompleted),
-            );
-            return true;
-        }
-        #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
-        super::diagnostics::record_game_event(
-            trace_event.with_disposition(super::diagnostics::Disposition::ReflexBypassForwarded),
-        );
-        return false;
-    }
-    let is_bridged_route = {
-        #[cfg(all(feature = "kuser", feature = "reflex"))]
-        {
-            matches!(bridged, Some(super::reflex_markers::Phase::Route))
-        }
-        #[cfg(not(all(feature = "kuser", feature = "reflex")))]
-        {
-            false
-        }
-    };
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    let is_target_process_route = if is_bridged_route {
-        false
-    } else {
-        let service = unsafe { gregs.add(libc::REG_RAX as usize).read() as u64 };
-        super::reflex_markers::is_registered_target_process(rip, service)
-    };
-    #[cfg(not(all(feature = "kuser", feature = "reflex")))]
-    let is_target_process_route = false;
-    if !is_bridged_route && !is_target_process_route {
-        #[cfg(all(feature = "debug", feature = "kuser", feature = "reflex"))]
-        trace_window_list(c"window list direct Wine route", gregs);
-        #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
-        super::diagnostics::record_game_event(trace_event);
-        return false;
-    }
-    let Some(selected_route) = route(context) else {
-        #[cfg(all(feature = "debug", feature = "kuser", feature = "reflex"))]
-        trace_window_list(c"window list unselected Wine route", gregs);
-        #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
-        super::diagnostics::record_game_event(
-            trace_event.with_disposition(super::diagnostics::Disposition::ReflexRouteDeclined),
-        );
-        #[cfg(all(feature = "kuser", feature = "reflex"))]
-        if is_bridged_route {
-            unsafe {
-                super::reflex_markers::cancel(
-                    tid,
-                    gregs.add(libc::REG_RSP as usize).read() as u64,
-                    rip,
-                );
-            }
-        }
-        return false;
-    };
-    #[cfg(all(feature = "debug", feature = "kuser", feature = "reflex"))]
-    trace_window_list(c"window list Reflex route", gregs);
-    #[cfg(feature = "debug")]
-    trace_reflex_hop(
-        if is_bridged_route {
-            c"reflex route (bridged)"
-        } else {
-            c"reflex route (target process)"
-        },
-        tid,
-        rip,
-        gregs,
-    );
-    #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
-    super::diagnostics::record_game_event(
-        trace_event.with_disposition(super::diagnostics::Disposition::ReflexRedirected),
-    );
     unsafe {
-        // `syscall` clears bits out of EFLAGS per the CPU's SFMASK before
-        // this trap is even delivered, stashing the true pre-call value in
-        // R11 (the ISA guarantee `sysret` relies on to restore it later). A
-        // real `int 2e` never touches EFLAGS at all, so Reflex's own
-        // hooked-syscall entry point — reverse-engineered to expect exactly
-        // what `int 2e` would hand it — needs that true value here, on the
-        // way in, not only restored on the bridged marker's `Phase::Replay`
-        // return trip above. R11/EFLAGS must be preserved on both hops,
-        // not just one.
         let r11 = gregs.add(libc::REG_R11 as usize).read();
         gregs.add(libc::REG_EFL as usize).write(r11);
-
-        let selector = gregs.add(libc::REG_RAX as usize).read() as u32;
-        let mut xmm4 = xmm.add(4).read();
-        xmm4[..4].copy_from_slice(&selector.to_le_bytes());
-        xmm.add(4).write(xmm4);
-        let rcx = gregs.add(libc::REG_RCX as usize).read() as u64;
-        let rax = if selected_route.rax_is_resume {
-            syscall_resume(rip, rcx)
-        } else {
-            rcx
-        };
-        gregs.add(libc::REG_RAX as usize).write(rax as libc::greg_t);
+        gregs.add(libc::REG_RAX as usize).write(rip as libc::greg_t);
         gregs
             .add(libc::REG_RCX as usize)
-            .write(selected_route.target as libc::greg_t);
+            .write(target as libc::greg_t);
         gregs
             .add(libc::REG_RIP as usize)
-            .write(selected_route.target as libc::greg_t);
+            .write(target as libc::greg_t);
     }
     true
 }
 
-fn syscall_resume(rip: u64, rcx: u64) -> u64 {
-    let mut instruction = [0u8; 2];
-    if crate::procmem::read_memory(rip, &mut instruction) && instruction == [0x0f, 0x05] {
-        rip.wrapping_add(2)
-    } else {
-        rcx
-    }
-}
-
-// Routing queries the real thread id; Miri does not model that syscall.
 #[cfg(all(test, feature = "artifact", not(miri)))]
 pub(in crate::syscall) mod artifact_tests {
-    use super::{Route, SYS_SECCOMP, SYS_USER_DISPATCH, redirect};
+    use super::{SYS_SECCOMP, SYS_USER_DISPATCH, redirect};
     use core::mem::MaybeUninit;
     use libc::{_libc_fpstate, greg_t, siginfo_t, ucontext_t};
 
@@ -533,7 +195,7 @@ pub(in crate::syscall) mod artifact_tests {
     const ORIGINAL_XMM4: [u32; 4] = [0x4444_4444; 4];
     const ORIGINAL_XMM5: [u32; 4] = [0x5555_5555; 4];
     const ART_BYPASS: [u32; 4] = [0x6969_6969, 0x6969_6969, 0xaaaa_aaaa, 0xbbbb_bbbb];
-    const REFLEX_BYPASS: [u32; 4] = [0x1337_1337, 0x1337_1337, 0xaaaa_aaaa, 0xbbbb_bbbb];
+    const UNKNOWN_BYPASS: [u32; 4] = [0x1337_1337, 0x1337_1337, 0xaaaa_aaaa, 0xbbbb_bbbb];
 
     #[repr(C, align(64))]
     struct ExtendedFpState {
@@ -566,8 +228,6 @@ pub(in crate::syscall) mod artifact_tests {
                 0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0x7777, 0x8888,
             ]);
             let mut instructions = Box::new([0x90; 32]);
-            // RIP is already after the first SYSCALL. The following bytes
-            // happen to encode another SYSCALL, and must not advance it again.
             instructions[14..18].copy_from_slice(&[0x0f, 0x05, 0x0f, 0x05]);
             let registers = &mut context.uc_mcontext.gregs;
             registers[libc::REG_RIP as usize] = unsafe { instructions.as_ptr().add(16) } as greg_t;
@@ -596,15 +256,9 @@ pub(in crate::syscall) mod artifact_tests {
         }
 
         fn route_art(&mut self, target: Option<u64>) -> bool {
-            unsafe {
-                redirect(&self.info, &mut self.context, target, |_| {
-                    panic!("ART routing must not consult Reflex")
-                })
-            }
+            unsafe { redirect(&self.info, &mut self.context, target) }
         }
 
-        /// Exercise the actual router on a trap and its later bypass; suitable
-        /// for the fork-isolated dispatcher saturation fixture.
         pub(in crate::syscall) fn saturated_roundtrip(
             &mut self,
             rsp: u64,
@@ -622,7 +276,7 @@ pub(in crate::syscall) mod artifact_tests {
             self.fpstate.legacy._xmm[5].element = ORIGINAL_XMM5;
             let initial = self.context.uc_mcontext.gregs;
 
-            if !unsafe { redirect(&self.info, &mut self.context, Some(TARGET), |_| None) } {
+            if !unsafe { redirect(&self.info, &mut self.context, Some(TARGET)) } {
                 return 13;
             }
             let mut expected = initial;
@@ -637,9 +291,6 @@ pub(in crate::syscall) mod artifact_tests {
                 return 14;
             }
 
-            // A forked child must not inherit this thread's pending flags.
-            // The child performs only the real signal path and exits without
-            // allocation or locks; its parent reaps it with a deadline.
             let child = unsafe { libc::fork() };
             if child < 0 {
                 return 18;
@@ -651,8 +302,7 @@ pub(in crate::syscall) mod artifact_tests {
                 self.context.uc_mcontext.gregs[libc::REG_EFL as usize] = 0x222;
                 self.fpstate.legacy._xmm[5].element = ART_BYPASS;
                 let own_registers = self.context.uc_mcontext.gregs;
-                let forwarded =
-                    !unsafe { redirect(&self.info, &mut self.context, Some(TARGET), |_| None) };
+                let forwarded = !unsafe { redirect(&self.info, &mut self.context, Some(TARGET)) };
                 let unchanged = self.context.uc_mcontext.gregs == own_registers
                     && self.fpstate.legacy._xmm[4].element == [service as u32, 0, 0, 0]
                     && self.fpstate.legacy._xmm[5].element == [0; 4];
@@ -688,7 +338,7 @@ pub(in crate::syscall) mod artifact_tests {
             self.context.uc_mcontext.gregs[libc::REG_R11 as usize] = 0x111;
             self.context.uc_mcontext.gregs[libc::REG_EFL as usize] = 0x222;
             self.fpstate.legacy._xmm[5].element = ART_BYPASS;
-            if unsafe { redirect(&self.info, &mut self.context, Some(TARGET), |_| None) } {
+            if unsafe { redirect(&self.info, &mut self.context, Some(TARGET)) } {
                 return 15;
             }
             if self.context.uc_mcontext.gregs != initial {
@@ -719,24 +369,22 @@ pub(in crate::syscall) mod artifact_tests {
             registers[libc::REG_EFL as usize] = 0x202;
             self.fpstate.legacy._xmm[5].element = ORIGINAL_XMM5;
             let first = self.context.uc_mcontext.gregs;
-            if !unsafe { redirect(&self.info, &mut self.context, Some(TARGET), |_| None) } {
+            if !unsafe { redirect(&self.info, &mut self.context, Some(TARGET)) } {
                 return 20;
             }
 
-            // The first callback handled the call, and the same site is now
-            // used by a new call with different real flags.
             self.context.uc_mcontext.gregs = first;
             self.context.uc_mcontext.gregs[libc::REG_R11 as usize] = 0x246;
             self.context.uc_mcontext.gregs[libc::REG_EFL as usize] = 0x206;
             let second = self.context.uc_mcontext.gregs;
-            if !unsafe { redirect(&self.info, &mut self.context, Some(TARGET), |_| None) } {
+            if !unsafe { redirect(&self.info, &mut self.context, Some(TARGET)) } {
                 return 21;
             }
             self.context.uc_mcontext.gregs = second;
             self.context.uc_mcontext.gregs[libc::REG_R11 as usize] = 0x111;
             self.context.uc_mcontext.gregs[libc::REG_EFL as usize] = 0x222;
             self.fpstate.legacy._xmm[5].element = ART_BYPASS;
-            if unsafe { redirect(&self.info, &mut self.context, Some(TARGET), |_| None) } {
+            if unsafe { redirect(&self.info, &mut self.context, Some(TARGET)) } {
                 return 22;
             }
             if self.context.uc_mcontext.gregs != second {
@@ -753,35 +401,6 @@ pub(in crate::syscall) mod artifact_tests {
         fn assert_unrelated_fpstate_unchanged(&self) {
             assert_eq!(self.fpstate.legacy._xmm[6].element, [0x6666_6666; 4]);
             assert_eq!(self.fpstate.upper_xstate, [0xa6; 1024]);
-        }
-    }
-
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    struct Marker {
-        tid: u64,
-        rsp: u64,
-        rip: u64,
-    }
-
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    impl Marker {
-        fn arm(fixture: &Fixture) -> Self {
-            let marker = Self {
-                tid: unsafe { libc::gettid() as u64 },
-                rsp: fixture.register(libc::REG_RSP),
-                rip: fixture.register(libc::REG_RIP),
-            };
-            assert!(super::super::reflex_markers::remember_marker(
-                marker.tid, marker.rsp, marker.rip
-            ));
-            marker
-        }
-    }
-
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    impl Drop for Marker {
-        fn drop(&mut self) {
-            super::super::reflex_markers::cancel(self.tid, self.rsp, self.rip);
         }
     }
 
@@ -900,8 +519,6 @@ pub(in crate::syscall) mod artifact_tests {
             assert_eq!(fixture.context.uc_mcontext.gregs, initial);
             assert_eq!(unsafe { core::slice::from_raw_parts(prefix, 512) }, before);
         }
-        // Without XSAVE magic, the exact same 512-byte frame is valid legacy
-        // state; its protected successor must never be accessed.
         unsafe { prefix.add(464).cast::<u32>().write_unaligned(0) };
         assert!(fixture.route_art(Some(TARGET)));
         assert_eq!(
@@ -912,9 +529,9 @@ pub(in crate::syscall) mod artifact_tests {
     }
 
     #[test]
-    fn artifact_does_not_accept_reflex_bypass_magic() {
+    fn artifact_does_not_accept_unknown_bypass_magic() {
         let mut fixture = Fixture::new(SYS_USER_DISPATCH);
-        fixture.fpstate.legacy._xmm[5].element = REFLEX_BYPASS;
+        fixture.fpstate.legacy._xmm[5].element = UNKNOWN_BYPASS;
         let rip = fixture.register(libc::REG_RIP);
         assert!(fixture.route_art(Some(TARGET)));
         assert_eq!(fixture.register(libc::REG_RAX), rip);
@@ -923,7 +540,7 @@ pub(in crate::syscall) mod artifact_tests {
             fixture.fpstate.legacy._xmm[4].element,
             [0x89ab_cdef, 0, 0, 0]
         );
-        assert_eq!(fixture.fpstate.legacy._xmm[5].element, REFLEX_BYPASS);
+        assert_eq!(fixture.fpstate.legacy._xmm[5].element, UNKNOWN_BYPASS);
         fixture.assert_unrelated_fpstate_unchanged();
     }
 
@@ -943,7 +560,7 @@ pub(in crate::syscall) mod artifact_tests {
 
     #[test]
     fn artifact_does_not_claim_seccomp_events() {
-        for xmm5 in [ART_BYPASS, REFLEX_BYPASS] {
+        for xmm5 in [ART_BYPASS, UNKNOWN_BYPASS] {
             let mut fixture = Fixture::new(SYS_SECCOMP);
             fixture.fpstate.legacy._xmm[5].element = xmm5;
             let initial = fixture.context.uc_mcontext.gregs;
@@ -953,242 +570,5 @@ pub(in crate::syscall) mod artifact_tests {
             assert_eq!(fixture.fpstate.legacy._xmm[5].element, xmm5);
             fixture.assert_unrelated_fpstate_unchanged();
         }
-    }
-
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    #[test]
-    fn artifact_seccomp_preserves_pending_marker_for_later_bypass() {
-        let mut fixture = Fixture::new(SYS_USER_DISPATCH);
-        let initial = fixture.context.uc_mcontext.gregs;
-        let stack = *fixture.stack;
-        let _marker = Marker::arm(&fixture);
-        assert!(fixture.route_art(Some(TARGET)));
-
-        fixture.info.si_code = SYS_SECCOMP;
-        fixture.context.uc_mcontext.gregs = initial;
-        fixture.context.uc_mcontext.gregs[libc::REG_R11 as usize] = 0x111;
-        fixture.context.uc_mcontext.gregs[libc::REG_EFL as usize] = 0x222;
-        fixture.fpstate.legacy._xmm[4].element = [0xaaaa_aaaa; 4];
-        fixture.fpstate.legacy._xmm[5].element = REFLEX_BYPASS;
-        let seccomp_registers = fixture.context.uc_mcontext.gregs;
-        assert!(!fixture.route_art(Some(TARGET)));
-        assert_eq!(fixture.context.uc_mcontext.gregs, seccomp_registers);
-        assert_eq!(*fixture.stack, stack);
-        assert_eq!(fixture.fpstate.legacy._xmm[4].element, [0xaaaa_aaaa; 4]);
-        assert_eq!(fixture.fpstate.legacy._xmm[5].element, REFLEX_BYPASS);
-        fixture.assert_unrelated_fpstate_unchanged();
-
-        fixture.info.si_code = SYS_USER_DISPATCH;
-        fixture.fpstate.legacy._xmm[5].element = ART_BYPASS;
-        assert!(!fixture.route_art(Some(TARGET)));
-        assert_eq!(fixture.register(libc::REG_R11), 0x8d7);
-        assert_eq!(fixture.register(libc::REG_EFL), 0x202);
-        assert_eq!(
-            fixture.fpstate.legacy._xmm[4].element,
-            [0x89ab_cdef, 0, 0, 0]
-        );
-        assert_eq!(fixture.fpstate.legacy._xmm[5].element, [0; 4]);
-        fixture.assert_unrelated_fpstate_unchanged();
-    }
-
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    #[test]
-    fn artifact_repeated_site_routes_again_instead_of_replaying_stale_marker() {
-        let mut fixture = Fixture::new(SYS_USER_DISPATCH);
-        let initial = fixture.context.uc_mcontext.gregs;
-        let _marker = Marker::arm(&fixture);
-        assert!(fixture.route_art(Some(TARGET)));
-
-        fixture.context.uc_mcontext.gregs = initial;
-        fixture.context.uc_mcontext.gregs[libc::REG_R11 as usize] = 0x246;
-        fixture.fpstate.legacy._xmm[4].element = [0xaaaa_aaaa; 4];
-        fixture.fpstate.legacy._xmm[5].element = [0xbbbb_bbbb; 4];
-        assert!(fixture.route_art(Some(TARGET)));
-        assert_eq!(
-            fixture.register(libc::REG_RAX),
-            initial[libc::REG_RIP as usize] as u64
-        );
-        assert_eq!(fixture.register(libc::REG_RIP), TARGET);
-        assert_eq!(fixture.register(libc::REG_EFL), 0x246);
-        assert_eq!(
-            fixture.fpstate.legacy._xmm[4].element,
-            [0x89ab_cdef, 0, 0, 0]
-        );
-        assert_eq!(fixture.fpstate.legacy._xmm[5].element, [0xbbbb_bbbb; 4]);
-        fixture.assert_unrelated_fpstate_unchanged();
-
-        fixture.context.uc_mcontext.gregs = initial;
-        fixture.context.uc_mcontext.gregs[libc::REG_R11 as usize] = 0x111;
-        fixture.context.uc_mcontext.gregs[libc::REG_EFL as usize] = 0x222;
-        fixture.fpstate.legacy._xmm[4].element = [0xcccc_cccc; 4];
-        fixture.fpstate.legacy._xmm[5].element = ART_BYPASS;
-        assert!(!fixture.route_art(Some(TARGET)));
-        assert_eq!(fixture.register(libc::REG_R11), 0x246);
-        assert_eq!(fixture.register(libc::REG_EFL), 0x202);
-        assert_eq!(
-            fixture.fpstate.legacy._xmm[4].element,
-            [0x89ab_cdef, 0, 0, 0]
-        );
-        assert_eq!(fixture.fpstate.legacy._xmm[5].element, [0; 4]);
-        fixture.assert_unrelated_fpstate_unchanged();
-    }
-
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    #[test]
-    fn artifact_bypass_retires_bridge_marker_and_restores_saved_flags_not_xmm_junk() {
-        let mut fixture = Fixture::new(SYS_USER_DISPATCH);
-        let initial = fixture.context.uc_mcontext.gregs;
-        let marker = Marker::arm(&fixture);
-        assert!(fixture.route_art(Some(TARGET)));
-
-        fixture.context.uc_mcontext.gregs = initial;
-        fixture.context.uc_mcontext.gregs[libc::REG_R11 as usize] = 0x111;
-        fixture.context.uc_mcontext.gregs[libc::REG_EFL as usize] = 0x222;
-        fixture.fpstate.legacy._xmm[4].element = [0xaaaa_aaaa; 4];
-        fixture.fpstate.legacy._xmm[5].element = ART_BYPASS;
-        assert!(!fixture.route_art(Some(TARGET)));
-        assert_eq!(fixture.register(libc::REG_R11), 0x8d7);
-        assert_eq!(fixture.register(libc::REG_EFL), 0x202);
-        assert_eq!(fixture.register(libc::REG_RAX), u64::from(SERVICE as u32));
-        assert_eq!(
-            fixture.register(libc::REG_RIP),
-            initial[libc::REG_RIP as usize] as u64
-        );
-        assert_eq!(
-            fixture.register(libc::REG_RSP),
-            initial[libc::REG_RSP as usize] as u64
-        );
-        assert_eq!(
-            fixture.fpstate.legacy._xmm[4].element,
-            [0x89ab_cdef, 0, 0, 0]
-        );
-        assert_eq!(fixture.fpstate.legacy._xmm[5].element, [0; 4]);
-        fixture.assert_unrelated_fpstate_unchanged();
-        assert!(
-            super::super::reflex_markers::consume(
-                marker.tid, marker.rsp, marker.rip, [0; 16], [0; 16], 0, 0,
-            )
-            .is_none()
-        );
-    }
-
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    #[test]
-    fn artifact_first_hop_bypass_cancels_unneeded_route_marker() {
-        let mut fixture = Fixture::new(SYS_USER_DISPATCH);
-        fixture.fpstate.legacy._xmm[5].element = ART_BYPASS;
-        let mut expected = fixture.context.uc_mcontext.gregs;
-        expected[libc::REG_RAX as usize] = 0x89ab_cdef;
-        let marker = Marker::arm(&fixture);
-        assert!(!fixture.route_art(Some(TARGET)));
-        assert_eq!(fixture.context.uc_mcontext.gregs, expected);
-        assert_eq!(
-            fixture.fpstate.legacy._xmm[4].element,
-            [0x89ab_cdef, 0, 0, 0]
-        );
-        assert_eq!(fixture.fpstate.legacy._xmm[5].element, [0; 4]);
-        assert!(
-            super::super::reflex_markers::consume(
-                marker.tid, marker.rsp, marker.rip, [0; 16], [0; 16], 0, 0,
-            )
-            .is_none()
-        );
-    }
-
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    #[test]
-    fn artifact_new_site_retires_completed_same_depth_marker() {
-        let mut fixture = Fixture::new(SYS_USER_DISPATCH);
-        let initial = fixture.context.uc_mcontext.gregs;
-        let marker = Marker::arm(&fixture);
-        assert!(fixture.route_art(Some(TARGET)));
-        fixture.context.uc_mcontext.gregs = initial;
-        fixture.context.uc_mcontext.gregs[libc::REG_RIP as usize] += 4;
-        let second_rip = fixture.register(libc::REG_RIP);
-        assert!(fixture.route_art(Some(TARGET)));
-        assert_eq!(fixture.register(libc::REG_RAX), second_rip);
-        assert_eq!(fixture.register(libc::REG_RIP), TARGET);
-        assert!(
-            super::super::reflex_markers::consume(
-                marker.tid, marker.rsp, marker.rip, [0; 16], [0; 16], 0, 0,
-            )
-            .is_none()
-        );
-    }
-
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    #[test]
-    fn artifact_feature_preserves_reflex_bridge_route_and_replay_saved_state() {
-        let mut fixture = Fixture::new(SYS_USER_DISPATCH);
-        let initial = fixture.context.uc_mcontext.gregs;
-        let _marker = Marker::arm(&fixture);
-        assert!(unsafe {
-            redirect(&fixture.info, &mut fixture.context, None, |_| {
-                Some(Route {
-                    target: TARGET,
-                    rax_is_resume: true,
-                })
-            })
-        });
-        assert_eq!(
-            fixture.register(libc::REG_RAX),
-            initial[libc::REG_RIP as usize] as u64 + 2
-        );
-        assert_eq!(
-            fixture.fpstate.legacy._xmm[4].element,
-            [0x89ab_cdef, 0x4444_4444, 0x4444_4444, 0x4444_4444]
-        );
-
-        fixture.context.uc_mcontext.gregs = initial;
-        fixture.context.uc_mcontext.gregs[libc::REG_R11 as usize] = 0x111;
-        fixture.context.uc_mcontext.gregs[libc::REG_EFL as usize] = 0x222;
-        fixture.fpstate.legacy._xmm[4].element = [0xaaaa_aaaa; 4];
-        fixture.fpstate.legacy._xmm[5].element = [0xbbbb_bbbb; 4];
-        assert!(!fixture.route_art(None));
-        assert_eq!(fixture.register(libc::REG_R11), 0x8d7);
-        assert_eq!(fixture.register(libc::REG_EFL), 0x202);
-        assert_eq!(fixture.fpstate.legacy._xmm[4].element, ORIGINAL_XMM4);
-        assert_eq!(fixture.fpstate.legacy._xmm[5].element, ORIGINAL_XMM5);
-        fixture.assert_unrelated_fpstate_unchanged();
-    }
-
-    #[test]
-    fn syscall_resume_handles_unreadable_and_page_boundary_rip_without_faulting() {
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        assert_eq!(page_size, 4096);
-        let raw = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
-                page_size * 2,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(raw, libc::MAP_FAILED);
-        struct Mapping(*mut core::ffi::c_void, usize);
-        impl Drop for Mapping {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::munmap(self.0, self.1);
-                }
-            }
-        }
-        let _guard = Mapping(raw, page_size * 2);
-        let bytes = raw.cast::<u8>();
-        assert_eq!(
-            unsafe { libc::mprotect(bytes.add(page_size).cast(), page_size, libc::PROT_NONE) },
-            0
-        );
-        unsafe {
-            bytes.add(page_size - 2).write(0x0f);
-            bytes.add(page_size - 1).write(0x05);
-        }
-        let at_end = bytes as u64 + page_size as u64 - 2;
-        assert_eq!(super::syscall_resume(at_end, 0xdead), at_end + 2);
-        let straddling = bytes as u64 + page_size as u64 - 1;
-        assert_eq!(super::syscall_resume(straddling, 0xbeef), 0xbeef);
-        assert_eq!(super::syscall_resume(0x1000, 0xcafe), 0xcafe);
     }
 }

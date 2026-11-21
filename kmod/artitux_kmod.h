@@ -2,13 +2,8 @@
 #ifndef ARTITUX_KMOD_UAPI_H
 #define ARTITUX_KMOD_UAPI_H
 
-#ifdef __KERNEL__
 #include <linux/ioctl.h>
 #include <linux/types.h>
-#else
-#include <linux/ioctl.h>
-#include <linux/types.h>
-#endif
 
 #define ARTITUX_KMOD_DEVICE_PATH "/dev/artitux"
 #define ARTITUX_KMOD_ABI_VERSION 1U

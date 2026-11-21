@@ -17,7 +17,7 @@ jobs:
       - name: Component lint configurations
         run: |
           for profile in dev release; do
-            for features in '' cpuid hooks reflex syscall kuser artifact faketime gamescope debug environment cpuid,hooks,reflex,syscall cpuid,hooks,reflex,syscall,kuser cpuid,hooks,reflex,syscall,kuser,faketime,gamescope; do
+            for features in '' cpuid hooks syscall kuser artifact faketime gamescope debug environment cpuid,hooks,syscall cpuid,hooks,syscall,kuser cpuid,hooks,syscall,kuser,faketime,gamescope; do
               cargo clippy -p artitux-runtime --lib --profile "$profile" --no-default-features --features "$features" -- -D warnings
             done
           done
@@ -27,8 +27,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal --component miri
       # Artifact code relies on raw syscalls, mmap, signals and fork, which Miri
-      # cannot emulate; Miri covers the same feature set it did upstream.
-      - run: cargo +nightly miri test -p artitux-runtime --lib --no-default-features --features cpuid,hooks,reflex,syscall,kuser,faketime,gamescope,debug,environment
+      # cannot emulate; Miri covers the non-Artifact feature set plus protocol.
+      - run: cargo +nightly miri test -p artitux-runtime --lib --no-default-features --features cpuid,hooks,syscall,kuser,faketime,gamescope,debug,environment
       - run: cargo +nightly miri test -p artitux-rust
   kmod:
     runs-on: ubuntu-latest

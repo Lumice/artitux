@@ -4,9 +4,7 @@
 //! match [`EXPORTS`] exactly, the ELF has the expected hardening
 //! (`RELRO`/`BIND_NOW`/`NODELETE`/no executable stack/no text relocations),
 //! and its `.init_array` constructors run in the fixed order [`ANCHORS`]
-//! lists. That verification is the actual safety net for the whole
-//! restructuring in this repo: a bad rename or a dropped `#[no_mangle]`
-//! fails the build immediately instead of silently shipping.
+//! lists.
 mod process;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,65 +17,32 @@ use tempfile::TempDir;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// Dynamic symbols exported by `Artitux.so` (libc `LD_PRELOAD` interposers only;
+/// all internal runtime functions stay hidden via `local: *;`).
 const EXPORTS: &[&str] = &[
-    "cpuid_configure_profile",
-    "cpuid_activate_legacy_profile",
-    "cpuid_get_fixed_reply",
-    "cpuid_sigsegv_handler",
-    "detect_cpu_vendor",
     "sigaction",
     "free",
     "malloc",
-    "read",
-    "pread",
     "mmap",
-    "unsetenv",
-    "artitux_setup_hooks",
-    "forward_signal",
-    "reflex_handle_cpuid",
-    "reflex_route_syscall",
-    "syscallhook",
-    "kuser_apply_to_buffer",
-    "patch_kuser_shared_data_recipe",
-    "patch_kuser_shared_data",
-    "gettimeofday",
-    "set_offset",
-    "artitux_setup_faketime",
+    "mprotect",
     "setenv",
-    "debug_enabled",
-    "debug_runtime_activated",
-    "debug_log",
-    "debug_log_hex",
-    "debug_log_dec",
+    "unsetenv",
+    "gettimeofday",
 ];
+
 const ANCHORS: &[&str] = &[
     "artitux_setup_debug",
     "artitux_setup_gamescope",
     "artitux_setup_environment",
     "artitux_setup_faketime",
     "artitux_setup_hooks",
-    "artitux_setup_kuser",
 ];
-const INTERPOSITION_HOOKS: &[&str] = &["read", "pread", "mmap"];
-const ARTIFACT_EXPORTS: &[&str] = &[
-    "artitux_artifact_prepare",
-    "artitux_artifact_after_return",
-    "mprotect",
-];
-
-fn exports(artifact: bool) -> impl Iterator<Item = &'static str> {
-    EXPORTS
-        .iter()
-        .copied()
-        .chain(ARTIFACT_EXPORTS.iter().copied().filter(move |_| artifact))
-}
 
 struct Context {
     root: PathBuf,
     target: PathBuf,
     scratch: TempDir,
     debug: bool,
-    artifact: bool,
     cargo: OsString,
     cc: OsString,
 }
@@ -98,9 +63,6 @@ impl Context {
             "artitux-runtime",
             "--message-format=json-render-diagnostics",
         ]);
-        if self.artifact {
-            cmd.args(["--features", "artifact"]);
-        }
         cmd.arg("--target-dir").arg(&self.target);
         if !self.debug {
             cmd.arg("--release");
@@ -149,7 +111,8 @@ impl Context {
             &map,
             format!(
                 "{{\n global:\n{} local: *;\n}};\n",
-                exports(self.artifact)
+                EXPORTS
+                    .iter()
                     .map(|name| format!(" {name};\n"))
                     .collect::<String>()
             ),
@@ -171,13 +134,8 @@ impl Context {
         for anchor in ANCHORS {
             cmd.arg(format!("-Wl,-u,{anchor}"));
         }
-        for hook in INTERPOSITION_HOOKS {
-            cmd.arg(format!("-Wl,-u,{hook}"));
-        }
-        if self.artifact {
-            for name in ARTIFACT_EXPORTS {
-                cmd.arg(format!("-Wl,-u,{name}"));
-            }
+        for name in EXPORTS {
+            cmd.arg(format!("-Wl,-u,{name}"));
         }
         cmd.arg(format!("-Wl,--version-script={}", map.display()))
             .arg(archive);
@@ -186,7 +144,7 @@ impl Context {
         if !self.debug {
             process::checked(Command::new("strip").arg("--strip-unneeded").arg(&library))?;
         }
-        verify_elf(&library, self.artifact)?;
+        verify_elf(&library)?;
         let parent = output
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -199,13 +157,13 @@ impl Context {
             "Built {} ({} bytes, {} C ABI exports)",
             output.display(),
             fs::metadata(output)?.len(),
-            exports(self.artifact).count()
+            EXPORTS.len()
         );
         Ok(())
     }
 }
 
-fn verify_elf(library: &Path, artifact: bool) -> Result<()> {
+fn verify_elf(library: &Path) -> Result<()> {
     let output = process::checked(
         Command::new("nm")
             .args(["-D", "--defined-only"])
@@ -216,7 +174,7 @@ fn verify_elf(library: &Path, artifact: bool) -> Result<()> {
         .lines()
         .filter_map(|line| line.split_whitespace().last())
         .collect();
-    let expected: BTreeSet<_> = exports(artifact).collect();
+    let expected: BTreeSet<_> = EXPORTS.iter().copied().collect();
     if actual != expected {
         return Err(format!(
             "export mismatch: missing {:?}, extra {:?}",
@@ -332,12 +290,11 @@ fn run() -> Result<()> {
         return Err("requires Linux x86-64 with glibc".into());
     }
     let mut debug = false;
-    let artifact = true;
     let mut output = None;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--debug") => debug = true,
-            // Artifact support is the default; the flag is kept for old scripts.
+            // Artifact support is the default; kept for older scripts.
             Some("--artifact") => {}
             Some("--output") => {
                 output = Some(PathBuf::from(
@@ -367,11 +324,10 @@ fn run() -> Result<()> {
     let ctx = Context {
         root,
         scratch: tempfile::Builder::new()
-            .prefix("audit-")
+            .prefix("artitux-build-")
             .tempdir_in(&target)?,
         target,
         debug,
-        artifact,
         cargo,
         cc: env::var_os("CC").unwrap_or_else(|| "cc".into()),
     };
@@ -394,17 +350,11 @@ mod export_tests {
     use super::*;
 
     #[test]
-    fn artifact_build_adds_only_the_opt_in_entry_points_and_resolver_observer() {
-        let standard: BTreeSet<_> = exports(false).collect();
-        let artifact: BTreeSet<_> = exports(true).collect();
-        assert_eq!(standard, EXPORTS.iter().copied().collect());
-        assert_eq!(artifact.len(), standard.len() + 3);
-        assert_eq!(
-            artifact
-                .difference(&standard)
-                .copied()
-                .collect::<BTreeSet<_>>(),
-            ARTIFACT_EXPORTS.iter().copied().collect()
-        );
+    fn exports_contain_only_unique_libc_interposers() {
+        let unique: BTreeSet<_> = EXPORTS.iter().copied().collect();
+        assert_eq!(unique.len(), EXPORTS.len());
+        assert!(unique.contains("mmap"));
+        assert!(unique.contains("mprotect"));
+        assert!(unique.contains("sigaction"));
     }
 }

@@ -79,12 +79,10 @@ MODULE_PARM_DESC(umip_idt_limit, "16-bit IDT limit written for SIDT under UMIP (
 /* Runtime state */
 static u64 host_xcr0;
 static bool xcr0_hook_active;
-static bool umip_hook_active;
 static u32 host_capabilities;
 
 static atomic_t tracked_count = ATOMIC_INIT(0);
 static atomic_t active_xcr0_count = ATOMIC_INIT(0);
-static atomic_t active_umip_count = ATOMIC_INIT(0);
 
 static DEFINE_PER_CPU(unsigned long, stat_xcr0_switches);
 static DEFINE_PER_CPU(unsigned long, stat_umip_fixups);
@@ -304,18 +302,11 @@ static void update_flag_counters_locked(u32 old_active, u32 new_active)
 {
 	bool old_xcr0 = !!(old_active & ARTITUX_FLAG_XCR0_7);
 	bool new_xcr0 = !!(new_active & ARTITUX_FLAG_XCR0_7);
-	bool old_umip = !!(old_active & ARTITUX_FLAG_UMIP);
-	bool new_umip = !!(new_active & ARTITUX_FLAG_UMIP);
 
 	if (!old_xcr0 && new_xcr0)
 		atomic_inc(&active_xcr0_count);
 	else if (old_xcr0 && !new_xcr0)
 		atomic_dec(&active_xcr0_count);
-
-	if (!old_umip && new_umip)
-		atomic_inc(&active_umip_count);
-	else if (old_umip && !new_umip)
-		atomic_dec(&active_umip_count);
 }
 
 /*
@@ -1318,7 +1309,6 @@ static int register_umip_hook(void)
 		return 0;
 	}
 	probe_umip_reg = true;
-	umip_hook_active = true;
 	host_capabilities |= ARTITUX_CAP_UMIP_HOOK;
 	pr_info("artitux_kmod: UMIP SGDT/SIDT fixup ready (gdt_limit=0x%04x, idt_limit=0x%04x, global=%d)\n",
 		umip_dummy_limit, umip_idt_limit, umip_global);

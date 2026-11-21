@@ -23,20 +23,38 @@ fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
 )))]
 compile_error!("artitux-runtime requires Linux x86_64 with glibc and 64-bit pointers");
 
-#[cfg(any(feature = "cpuid", feature = "faketime"))]
+#[cfg(feature = "faketime")]
 mod clock;
-#[cfg(any(feature = "cpuid", feature = "syscall"))]
+#[cfg(feature = "artifact")]
 mod config;
 #[cfg(any(
     feature = "cpuid",
     feature = "syscall",
     feature = "debug",
-    feature = "kuser"
+    feature = "artifact",
+    feature = "faketime"
 ))]
 mod errno;
-#[cfg(any(feature = "cpuid", feature = "kuser"))]
+#[cfg(any(
+    feature = "artifact",
+    all(
+        feature = "cpuid",
+        feature = "hooks",
+        feature = "syscall",
+        feature = "kuser"
+    )
+))]
 mod maps;
-#[cfg(feature = "kuser")]
+#[cfg(any(
+    feature = "artifact",
+    feature = "faketime",
+    all(
+        feature = "cpuid",
+        feature = "hooks",
+        feature = "syscall",
+        feature = "kuser"
+    )
+))]
 mod page_guard;
 #[cfg(any(feature = "cpuid", feature = "syscall"))]
 mod procmem;
@@ -68,10 +86,6 @@ pub mod faketime;
 pub mod gamescope;
 #[cfg(feature = "hooks")]
 pub mod hooks;
-#[cfg(feature = "kuser")]
-pub mod kuser;
-#[cfg(feature = "reflex")]
-pub mod reflex;
 #[cfg(feature = "environment")]
 pub mod registry;
 #[cfg(feature = "syscall")]

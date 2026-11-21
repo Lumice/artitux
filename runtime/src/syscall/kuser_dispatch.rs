@@ -1,28 +1,21 @@
-//! Installs Artitux's own handler in Wine's KUSER dispatcher slot and
-//! classifies every call that arrives through it.
+//! Installs Artitux's handler in Wine's KUSER dispatcher slot and classifies
+//! calls arriving through it for a registered Artifact process.
 //!
-//! Reflex calls require a copied stub discovered through its IAT and caller
-//! evidence. A positively registered ART process instead recognizes Wine's
-//! CALL-through-KUSER stubs directly. Both replay the evidenced raw SYSCALL;
-//! marked ART bypasses instead retain Wine's original dispatcher and receive
-//! the source contract's service/XMM normalization. Protocol semantics are
-//! handled afterward at the [`super::sigsys_router`] boundary.
-//!
-//! See [`should_replay_raw`] for the classification rule.
+//! Recognized Wine CALL-through-KUSER stubs replay the raw SYSCALL so
+//! [`super::sigsys_router`] can route them to Artifact's callback; marked
+//! Artifact bypasses retain Wine's original dispatcher with service/XMM
+//! normalization.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::mem::trampoline_destination;
-use crate::procmem::{read_memory, read_u32, read_u64, read_u64s};
+use crate::procmem::{read_memory, read_u64};
 
 const WINE_DISPATCHER_SLOT: u64 = 0x7ffe_1000;
 const THUNK_RETURN_OFFSET: u64 = 0x1f;
-const IAT_CAPACITY: usize = 4096;
 const RAW_TARGET_TAG: u64 = 1 << 63;
 
 // Exact saved frame constructed by dispatcher_bridge before changing stacks.
-#[cfg(feature = "artifact")]
 #[repr(C)]
 struct DispatcherFrame {
     registers: [u64; 15], // R15..RAX, as pushed by the bridge.
@@ -32,7 +25,6 @@ struct DispatcherFrame {
     return_address: u64,
 }
 
-#[cfg(feature = "artifact")]
 const _: () = assert!(
     core::mem::offset_of!(DispatcherFrame, flags) == 0x78
         && core::mem::offset_of!(DispatcherFrame, xmm) == 0x80
@@ -40,35 +32,15 @@ const _: () = assert!(
         && core::mem::offset_of!(DispatcherFrame, return_address) == 0x188
         && core::mem::size_of::<DispatcherFrame>() == 0x190
 );
-const SYSCALL_INSTRUCTION: [u8; 2] = [0x0f, 0x05];
-const PEB_IMAGE_BASE_OFFSET: u64 = 0x10;
-const TEB_PEB_OFFSET: u64 = 0x60;
-const IAT_SCAN_MAX_RETRY_INTERVAL: u64 = 1024;
-/// Thunks read per `process_vm_readv` call while scanning an IAT/lookup
-/// table, instead of one syscall per 8-byte entry — an import table with a
-/// few hundred entries previously cost hundreds of syscalls per scan attempt.
-const IAT_THUNK_CHUNK: usize = 64;
-/// Open-addressed set of stub addresses; twice [`IAT_CAPACITY`] keeps probes
-/// short, and a power of two keeps the index a mask.
-const IAT_STUB_SLOTS: usize = IAT_CAPACITY * 2;
 
 static ORIGINAL_DISPATCHER: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_INSTALLED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_INSTALL_SUCCESS_LOGGED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_INSTALL_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
-static REFLEX_IMAGE_START: AtomicU64 = AtomicU64::new(0);
-static REFLEX_IMAGE_END: AtomicU64 = AtomicU64::new(0);
-static IAT_STUB_COUNT: AtomicU64 = AtomicU64::new(0);
-static IAT_SCAN_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-static IAT_SCAN_SUCCESS_LOGGED: AtomicBool = AtomicBool::new(false);
-static IAT_SCAN_MISS_LOGGED: AtomicBool = AtomicBool::new(false);
-static IAT_SCAN_LOCK: AtomicBool = AtomicBool::new(false);
-static IAT_STUBS: [AtomicU64; IAT_STUB_SLOTS] = [const { AtomicU64::new(0) }; IAT_STUB_SLOTS];
 
 unsafe extern "C" {
     fn debug_log(message: *const core::ffi::c_char);
     fn debug_log_hex(prefix: *const core::ffi::c_char, value: u64);
-    fn debug_log_dec(prefix: *const core::ffi::c_char, value: u64);
 }
 
 fn log(message: &'static core::ffi::CStr) {
@@ -79,292 +51,10 @@ fn log_hex(prefix: &'static core::ffi::CStr, value: u64) {
     unsafe { debug_log_hex(prefix.as_ptr(), value) };
 }
 
-fn log_dec(prefix: &'static core::ffi::CStr, value: u64) {
-    unsafe { debug_log_dec(prefix.as_ptr(), value) };
-}
-
 fn log_install_failure() {
     if !BRIDGE_INSTALL_FAILURE_LOGGED.swap(true, Ordering::AcqRel) {
-        log(c"reflex bridge install failed; will retry at KUSER handshake");
+        log(c"artifact dispatcher bridge install failed");
     }
-}
-
-#[cfg(feature = "cpuid")]
-pub(super) fn register_reflex_dispatch_handler(handler: u64) {
-    register_reflex_image(handler);
-}
-
-/// Locate the loaded PE image containing `handler` (Reflex's registered
-/// resume/dispatch target) by walking backward from its page in
-/// `0x1000`-sized steps looking for a `MZ`/`PE` header whose `SizeOfImage`
-/// covers it. Reflex's own image range, once known, lets
-/// [`should_replay_raw`]'s caller-evidence check exclude Reflex's *internal*
-/// calls (which are never syscall stubs) from the replay path.
-#[cfg(feature = "cpuid")]
-fn register_reflex_image(handler: u64) {
-    if handler == 0 || REFLEX_IMAGE_START.load(Ordering::Acquire) != 0 {
-        return;
-    }
-    let first_page = handler & !0xfff;
-    for offset in (0..=0x10_0000).step_by(0x1000) {
-        let Some(base) = first_page.checked_sub(offset) else {
-            break;
-        };
-        let mut dos = [0u8; 0x40];
-        if !read_memory(base, &mut dos) || dos[..2] != *b"MZ" {
-            continue;
-        }
-        let pe_offset = u32::from_le_bytes(dos[0x3c..0x40].try_into().unwrap()) as u64;
-        if pe_offset > 0x1000 {
-            continue;
-        }
-        let mut headers = [0u8; 0x60];
-        if !read_memory(base + pe_offset, &mut headers) || headers[..4] != *b"PE\0\0" {
-            continue;
-        }
-        let image_size = u32::from_le_bytes(headers[80..84].try_into().unwrap()) as u64;
-        let Some(end) = base.checked_add(image_size) else {
-            continue;
-        };
-        if image_size != 0 && (base..end).contains(&handler) {
-            REFLEX_IMAGE_END.store(end, Ordering::Relaxed);
-            REFLEX_IMAGE_START.store(base, Ordering::Release);
-            return;
-        }
-    }
-}
-
-fn is_reflex_address(address: u64) -> bool {
-    let start = REFLEX_IMAGE_START.load(Ordering::Acquire);
-    let end = REFLEX_IMAGE_END.load(Ordering::Acquire);
-    start != 0 && (start..end).contains(&address)
-}
-
-fn stub_probe(address: u64) -> impl Iterator<Item = usize> {
-    let hash = (address >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32;
-    (0..IAT_STUB_SLOTS).map(move |offset| (hash as usize + offset) & (IAT_STUB_SLOTS - 1))
-}
-
-/// Inserts are serialized by `IAT_SCAN_LOCK`; slots only ever go from zero to
-/// an address, so lock-free readers see a consistent set.
-fn remember_stub(address: u64) -> bool {
-    if address == 0 || IAT_STUB_COUNT.load(Ordering::Acquire) >= IAT_CAPACITY as u64 {
-        return false;
-    }
-    for index in stub_probe(address) {
-        match IAT_STUBS[index].compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => {
-                IAT_STUB_COUNT.fetch_add(1, Ordering::AcqRel);
-                return true;
-            }
-            Err(existing) if existing == address => return false,
-            Err(_) => {}
-        }
-    }
-    false
-}
-
-/// Scan the current process's mapped main-image IAT for Reflex-style
-/// trampolines. This uses PE import descriptors to bound the scan, so syscall
-/// routing does not depend on observing Reflex's individual protection calls.
-/// The scan is retried until Reflex has populated the IAT.
-fn scan_main_image_iat() -> usize {
-    if IAT_SCAN_LOCK
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return 0;
-    }
-    let found = scan_main_image_iat_locked();
-    IAT_SCAN_LOCK.store(false, Ordering::Release);
-    if found == 0 && !IAT_SCAN_MISS_LOGGED.swap(true, Ordering::AcqRel) {
-        log(c"main PE IAT scan found no Reflex trampolines yet");
-    }
-    found
-}
-
-fn scan_main_image_iat_locked() -> usize {
-    let mut gs_base = 0u64;
-    // Wine's x86-64 TEB is the thread GS base; TEB+0x60 points to the PEB.
-    // Use arch_prctl rather than reading a compiler/platform-specific GS
-    // intrinsic from this shared library.
-    let got_gs = unsafe {
-        libc::syscall(
-            libc::SYS_arch_prctl,
-            0x1004i64, // ARCH_GET_GS
-            &mut gs_base as *mut u64,
-        )
-    } == 0;
-    if !got_gs || gs_base == 0 {
-        return 0;
-    }
-    let Some(peb) = read_u64(gs_base.saturating_add(TEB_PEB_OFFSET)) else {
-        return 0;
-    };
-    let Some(image_base) = read_u64(peb.saturating_add(PEB_IMAGE_BASE_OFFSET)) else {
-        return 0;
-    };
-    if image_base == 0 {
-        return 0;
-    }
-
-    let Some(mz) = read_u32(image_base) else {
-        return 0;
-    };
-    if mz as u16 != 0x5a4d {
-        return 0;
-    }
-    let Some(pe_offset) = read_u32(image_base.saturating_add(0x3c)) else {
-        return 0;
-    };
-    if pe_offset > 0x1000 {
-        return 0;
-    }
-    let Some(pe_signature) = read_u32(image_base.saturating_add(pe_offset as u64)) else {
-        return 0;
-    };
-    if pe_signature != u32::from_le_bytes(*b"PE\0\0") {
-        return 0;
-    }
-
-    let optional = image_base
-        .saturating_add(pe_offset as u64)
-        .saturating_add(24);
-    let Some(magic) = read_u32(optional) else {
-        return 0;
-    };
-    if magic as u16 != 0x20b {
-        return 0;
-    }
-    let Some(image_size) = read_u32(optional.saturating_add(56)) else {
-        return 0;
-    };
-    let Some(import_rva) = read_u32(optional.saturating_add(120)) else {
-        return 0;
-    };
-    if image_size == 0 || import_rva == 0 || import_rva >= image_size {
-        return 0;
-    }
-
-    let mut found = 0usize;
-    let max_descriptors = ((image_size - import_rva) / 20).min(4096);
-    for index in 0..max_descriptors {
-        let descriptor = image_base
-            .saturating_add(import_rva as u64)
-            .saturating_add(u64::from(index) * 20);
-        let Some(name_rva) = read_u32(descriptor.saturating_add(12)) else {
-            break;
-        };
-        if name_rva == 0 {
-            break;
-        }
-        let Some(iat_rva) = read_u32(descriptor.saturating_add(16)) else {
-            break;
-        };
-        let Some(original_thunk_rva) = read_u32(descriptor) else {
-            break;
-        };
-        if iat_rva == 0 || iat_rva >= image_size {
-            continue;
-        }
-
-        // Count imports through the original lookup table, as Reflex does.
-        // This avoids scanning gaps between unrelated IAT runs in a merged
-        // range; if OriginalFirstThunk is absent, the IAT retains its zero
-        // terminator after Reflex replaces its non-null entries.
-        let lookup_rva = if original_thunk_rva == 0 {
-            iat_rva
-        } else {
-            original_thunk_rva
-        };
-        if lookup_rva >= image_size {
-            continue;
-        }
-        let max_thunks = (image_size.saturating_sub(lookup_rva) / 8).min(65_536);
-        // Read the lookup table and IAT a chunk at a time; stopping at the
-        // first unreadable or zero entry matches reading them one by one.
-        let mut thunk = 0u32;
-        'thunks: while thunk < max_thunks {
-            let count = ((max_thunks - thunk) as usize).min(IAT_THUNK_CHUNK);
-            let offset = u64::from(thunk) * 8;
-            let mut imports = [0u64; IAT_THUNK_CHUNK];
-            let mut values = [0u64; IAT_THUNK_CHUNK];
-            let imports_read = read_u64s(
-                image_base
-                    .saturating_add(lookup_rva as u64)
-                    .saturating_add(offset),
-                &mut imports,
-                count,
-            );
-            let values_read = read_u64s(
-                image_base
-                    .saturating_add(iat_rva as u64)
-                    .saturating_add(offset),
-                &mut values,
-                count,
-            );
-            for index in 0..count {
-                if index >= imports_read
-                    || imports[index] == 0
-                    || index >= values_read
-                    || values[index] == 0
-                {
-                    break 'thunks;
-                }
-                if let Some(destination) = trampoline_destination(values[index])
-                    && remember_stub(destination)
-                {
-                    found += 1;
-                }
-            }
-            thunk += count as u32;
-        }
-    }
-    if found != 0 && !IAT_SCAN_SUCCESS_LOGGED.swap(true, Ordering::AcqRel) {
-        log(c"reflex IAT trampolines discovered from main PE import table");
-        log_hex(c"reflex main image base=", image_base);
-        log_dec(
-            c"reflex IAT trampoline targets discovered=",
-            IAT_STUB_COUNT.load(Ordering::Acquire),
-        );
-    }
-    found
-}
-
-pub(super) fn maybe_scan_main_image_iat() {
-    if IAT_STUB_COUNT.load(Ordering::Acquire) != 0
-        || REFLEX_IMAGE_START.load(Ordering::Acquire) == 0
-    {
-        return;
-    }
-    let attempt = IAT_SCAN_ATTEMPTS.fetch_add(1, Ordering::AcqRel);
-    if should_retry_iat_scan(attempt) {
-        let _ = scan_main_image_iat();
-    }
-}
-
-fn should_retry_iat_scan(attempt: u64) -> bool {
-    // Retry promptly during registration, then bound the cost for games
-    // whose IAT never contains a Reflex trampoline. Late hooks are still
-    // discovered on a later call, at most 1024 dispatcher hits away.
-    attempt == 0 || attempt.is_power_of_two() || attempt.is_multiple_of(IAT_SCAN_MAX_RETRY_INTERVAL)
-}
-
-fn matches_iat_stub(return_address: u64) -> bool {
-    if IAT_STUB_COUNT.load(Ordering::Acquire) == 0 {
-        return false;
-    }
-    let Some(stub) = stub_for_return(return_address) else {
-        return false;
-    };
-    for index in stub_probe(stub) {
-        match IAT_STUBS[index].load(Ordering::Acquire) {
-            0 => return false,
-            entry if entry == stub => return true,
-            _ => {}
-        }
-    }
-    false
 }
 
 /// The stub entry whose call returns to `return_address`.
@@ -374,51 +64,8 @@ fn stub_for_return(return_address: u64) -> Option<u64> {
         .filter(|&stub| stub != 0)
 }
 
-#[cfg(test)]
-fn return_matches_stub(return_address: u64, stub: u64) -> bool {
-    stub_for_return(return_address) == Some(stub)
-}
-
-fn find_raw_syscall_instruction(code: &[u8], code_address: u64, service: u64) -> Option<u64> {
-    for syscall_offset in (2..=code.len()).rev() {
-        if code[syscall_offset - 2..syscall_offset] != SYSCALL_INSTRUCTION {
-            continue;
-        }
-        if syscall_service_before(code, syscall_offset) == Some(service) {
-            return code_address.checked_add((syscall_offset - 2) as u64);
-        }
-    }
-    None
-}
-
-fn syscall_service_before(code: &[u8], syscall_offset: usize) -> Option<u64> {
-    let start = syscall_offset.saturating_sub(26);
-    (start..syscall_offset.saturating_sub(8))
-        .rev()
-        .find(|&offset| code[offset..offset + 3] == [0x4c, 0x8b, 0xd1] && code[offset + 3] == 0xb8)
-        .map(|offset| u32::from_le_bytes(code[offset + 4..offset + 8].try_into().unwrap()) as u64)
-}
-
-fn find_syscall(return_address: u64, service: u64) -> Option<u64> {
-    for window in [0x80usize, 0x40, 0x20] {
-        let Some(start) = return_address.checked_sub(window as u64) else {
-            continue;
-        };
-        let mut bytes = [0u8; 0x80];
-        if !read_memory(start, &mut bytes[..window]) {
-            continue;
-        }
-        if let Some(address) = find_raw_syscall_instruction(&bytes[..window], start, service) {
-            return Some(address);
-        }
-    }
-    None
-}
-
-/// Recognize Wine's CALL-through-KUSER thunk before bypassing the narrower
-/// Reflex IAT/caller filters. The service, SystemCall branch, and CALL slot
-/// must all belong to this same stub; an unrelated nearby SYSCALL is not
-/// sufficient evidence.
+/// Recognize Wine's CALL-through-KUSER thunk. The service, SystemCall branch,
+/// and CALL slot must all belong to this same stub.
 fn find_artifact_wine_syscall(return_address: u64, service: u64) -> Option<u64> {
     let start = stub_for_return(return_address)?;
     let service = u32::try_from(service).ok()?;
@@ -440,76 +87,30 @@ fn find_artifact_wine_syscall(return_address: u64, service: u64) -> Option<u64> 
     start.checked_add(0x12)
 }
 
-/// The evidence `dispatcher_target` gathers for one KUSER dispatcher call,
-/// in the order it becomes available (cheapest first, so the expensive
-/// `find_syscall` memory scan is only attempted once the cheaper checks
-/// already passed).
-#[derive(Clone, Copy)]
-struct DispatchEvidence {
-    /// Wine's own dispatcher has been observed (the bridge is fully armed).
-    original_dispatcher_known: bool,
-    /// The return address matches a stub the IAT scan found Reflex hooking.
-    stub_match: bool,
-    /// The caller is inside Reflex's own image, not a copied stub calling in
-    /// from outside it.
-    caller_is_reflex_image: bool,
-    /// A raw `syscall` instruction for this service was found near the
-    /// return address.
-    raw_syscall_found: bool,
-}
-
-/// Reflex requires the IAT/caller evidence. A registered ART callback instead
-/// uses an independently recognized Wine CALL thunk; both paths require the
-/// original dispatcher and a matching raw SYSCALL.
-fn should_replay_raw(evidence: DispatchEvidence, artifact: bool) -> bool {
-    evidence.original_dispatcher_known
-        && evidence.raw_syscall_found
-        && (artifact || (evidence.stub_match && !evidence.caller_is_reflex_image))
-}
-
 /// The KUSER dispatcher bridge's Rust selector, called from
-/// [`dispatcher_bridge`]'s naked-asm trampoline on Wine's own stack. Returns
-/// the target to jump to: either the original Wine dispatcher, or a raw
-/// syscall address tagged in bit 63 (cleared and consumed by the trampoline
-/// itself before it jumps there — see the frame-layout comment on
-/// `dispatcher_bridge`).
+/// [`dispatcher_bridge`]'s naked-asm trampoline on a private per-thread stack.
 unsafe extern "C" fn dispatcher_target(
     return_address: u64,
     service: u64,
-    r10: u64,
-    _saved_frame: *mut c_void,
+    saved_frame: *mut c_void,
     xmm5: u64,
     entry_rsp: u64,
 ) -> u64 {
-    let _ = r10;
     let original = ORIGINAL_DISPATCHER.load(Ordering::Acquire);
-    #[cfg(feature = "artifact")]
     let artifact = crate::artifact::active() && crate::artifact::syscall_target().is_some();
-    #[cfg(not(feature = "artifact"))]
-    let artifact = false;
-    #[cfg(feature = "artifact")]
-    {
-        // SAFETY: dispatcher_bridge saved the complete, exclusively owned
-        // frame before switching to the selector's private stack.
-        let frame = unsafe { &mut *_saved_frame.cast::<DispatcherFrame>() };
-        unsafe {
-            dispatcher_target_for_frame(
-                return_address,
-                service,
-                entry_rsp,
-                original,
-                artifact,
-                xmm5,
-                frame,
-            )
-        }
-    }
-    #[cfg(not(feature = "artifact"))]
-    {
-        let _ = xmm5;
-        unsafe {
-            dispatcher_target_for_process(return_address, service, entry_rsp, original, artifact)
-        }
+    // SAFETY: dispatcher_bridge saved the complete, exclusively owned
+    // frame before switching to the selector's private stack.
+    let frame = unsafe { &mut *saved_frame.cast::<DispatcherFrame>() };
+    unsafe {
+        dispatcher_target_for_frame(
+            return_address,
+            service,
+            entry_rsp,
+            original,
+            artifact,
+            xmm5,
+            frame,
+        )
     }
 }
 
@@ -520,76 +121,27 @@ unsafe fn dispatcher_target_for_process(
     original: u64,
     artifact: bool,
 ) -> u64 {
-    #[cfg(feature = "artifact")]
     let _dispatch_guard = unsafe { crate::artifact::wine_dispatch_guard() };
-    if !artifact {
-        maybe_scan_main_image_iat();
-        super::unixlib_repair::maybe_repair_wine_unixlib_exports();
+    if !artifact || original == 0 {
+        return original;
     }
     let trap_rsp = entry_rsp.saturating_add(8);
-    #[cfg(feature = "artifact")]
-    if artifact {
-        super::artifact_flags::retire(trap_rsp);
-    }
-    let mut tid = 0;
-    if super::reflex_markers::has_active_markers() {
-        tid = unsafe { libc::gettid() as u64 };
-        super::reflex_markers::retire_markers(tid, trap_rsp);
-    }
+    super::artifact_flags::retire(trap_rsp);
 
-    if original == 0 {
+    let Some(raw) = find_artifact_wine_syscall(return_address, service) else {
         return original;
-    }
-    let stub_match = !artifact && matches_iat_stub(return_address);
-    if !artifact && !stub_match {
-        return original;
-    }
-    let caller_is_reflex_image =
-        !artifact && is_reflex_address(read_u64(entry_rsp.saturating_add(8)).unwrap_or(0));
-    if !artifact && caller_is_reflex_image {
-        return original;
-    }
-    let raw = if artifact {
-        find_artifact_wine_syscall(return_address, service)
-    } else {
-        find_syscall(return_address, service)
     };
-    if !should_replay_raw(
-        DispatchEvidence {
-            original_dispatcher_known: true,
-            stub_match,
-            caller_is_reflex_image,
-            raw_syscall_found: raw.is_some(),
-        },
-        artifact,
-    ) {
-        return original;
-    }
-    let raw = raw.expect("raw_syscall_found was checked above");
     let trap_rip = raw.saturating_add(2);
-    #[cfg(feature = "artifact")]
-    if artifact {
-        // Keep ART's per-call flags independently of the Reflex marker
-        // table, including when a later same-site call must be re-armed.
-        if !super::artifact_flags::reserve(trap_rsp, trap_rip) {
-            const MESSAGE: &[u8] = b"Artitux: ART syscall flag storage unavailable\n";
-            unsafe {
-                libc::write(libc::STDERR_FILENO, MESSAGE.as_ptr().cast(), MESSAGE.len());
-                libc::_exit(127);
-            }
+    if !super::artifact_flags::reserve(trap_rsp, trap_rip) {
+        const MESSAGE: &[u8] = b"Artitux: ART syscall flag storage unavailable\n";
+        unsafe {
+            libc::write(libc::STDERR_FILENO, MESSAGE.as_ptr().cast(), MESSAGE.len());
+            libc::_exit(127);
         }
-        return raw | RAW_TARGET_TAG;
-    }
-    if tid == 0 {
-        tid = unsafe { libc::gettid() as u64 };
-    }
-    if !super::reflex_markers::remember_marker(tid, trap_rsp, trap_rip) {
-        return original;
     }
     raw | RAW_TARGET_TAG
 }
 
-#[cfg(feature = "artifact")]
 unsafe fn dispatcher_target_for_frame(
     return_address: u64,
     service: u64,
@@ -600,15 +152,10 @@ unsafe fn dispatcher_target_for_frame(
     frame: &mut DispatcherFrame,
 ) -> u64 {
     if artifact && original != 0 && crate::artifact::is_syscall_bypass(xmm5) {
-        // The source contract applies before canonical-stub decoding: even
-        // noncanonical callers carry a real service in EAX. Leave their
-        // continuation, flags, arguments and nonvolatile state untouched.
         let service = u64::from(service as u32);
         frame.registers[14] = service;
         frame.xmm[4] = [service, 0];
         frame.xmm[5] = [0, 0];
-        // An ordinary bypass never reserves/retires raw-replay flag frames,
-        // changes the selector, or executes a Windows ID as a Linux syscall.
         return original;
     }
     unsafe { dispatcher_target_for_process(return_address, service, entry_rsp, original, artifact) }
@@ -644,7 +191,7 @@ unsafe extern "C" fn dispatcher_bridge() {
         "movdqu [rsp + 0xc0], xmm12", "movdqu [rsp + 0xd0], xmm13", "movdqu [rsp + 0xe0], xmm14", "movdqu [rsp + 0xf0], xmm15",
         "pushfq", "push rax", "push rbx", "push rcx", "push rdx", "push rsi", "push rdi", "push rbp", "push r8", "push r9", "push r10", "push r11", "push r12", "push r13", "push r14", "push r15",
         "mov rbx, rsp",
-        "mov rdi, [rbx + 0x188]", "lea r9, [rbx + 0x188]", "mov rsi, [rbx + 0x70]", "mov rdx, [rbx + 0x28]", "mov rcx, rbx", "mov r8, [rbx + 0xd0]",
+        "mov rdi, [rbx + 0x188]", "mov rsi, [rbx + 0x70]", "mov rdx, rbx", "mov rcx, [rbx + 0xd0]", "lea r8, [rbx + 0x188]",
         // Run the Rust selector on a private per-thread stack. Everything
         // above this point is spilled to the Windows stack inside a fixed
         // 0x190-byte frame, like the Reflex handler itself; the selector's
@@ -850,9 +397,9 @@ pub(super) fn install() -> bool {
     if unsafe { swap_dispatcher_slot(slot, bridge, &ORIGINAL_DISPATCHER, expected_original) } {
         BRIDGE_INSTALLED.store(true, Ordering::Release);
         if !BRIDGE_INSTALL_SUCCESS_LOGGED.swap(true, Ordering::AcqRel) {
-            log(c"reflex bridge installed");
+            log(c"artifact dispatcher bridge installed");
             log_hex(
-                c"reflex bridge original Wine dispatcher=",
+                c"artifact bridge original Wine dispatcher=",
                 ORIGINAL_DISPATCHER.load(Ordering::Acquire),
             );
         }
@@ -865,108 +412,6 @@ pub(super) fn install() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DispatchEvidence, find_raw_syscall_instruction, return_matches_stub, should_replay_raw,
-        should_retry_iat_scan,
-    };
-
-    #[test]
-    fn iat_scan_retries_taper_off_but_continue_for_late_hooks() {
-        for attempt in [0, 1, 2, 4, 8, 16, 1024, 2048] {
-            assert!(should_retry_iat_scan(attempt));
-        }
-        for attempt in [3, 6, 17, 1023, 1025, 2047] {
-            assert!(!should_retry_iat_scan(attempt));
-        }
-    }
-
-    #[test]
-    fn copied_stub_lookup_requires_the_requested_service_number() {
-        let code = [0x4c, 0x8b, 0xd1, 0xb8, 0x46, 0x02, 0x00, 0x00, 0x0f, 0x05];
-        assert_eq!(
-            find_raw_syscall_instruction(&code, 0x1234_5000, 0x246),
-            Some(0x1234_5008)
-        );
-        assert_eq!(
-            find_raw_syscall_instruction(&code, 0x1234_5000, 0x206),
-            None
-        );
-    }
-
-    #[test]
-    fn dispatcher_return_must_match_the_discovered_stub_entry() {
-        assert!(return_matches_stub(0x10001f, 0x100000));
-        assert!(!return_matches_stub(0x100020, 0x100000));
-        assert!(!return_matches_stub(0x10, 0x100000));
-    }
-
-    #[test]
-    fn replays_raw_only_when_all_evidence_lines_up() {
-        let all_true = DispatchEvidence {
-            original_dispatcher_known: true,
-            stub_match: true,
-            caller_is_reflex_image: false,
-            raw_syscall_found: true,
-        };
-        assert!(should_replay_raw(all_true, false));
-
-        assert!(!should_replay_raw(
-            DispatchEvidence {
-                original_dispatcher_known: false,
-                ..all_true
-            },
-            false
-        ));
-        assert!(!should_replay_raw(
-            DispatchEvidence {
-                stub_match: false,
-                ..all_true
-            },
-            false
-        ));
-        assert!(!should_replay_raw(
-            DispatchEvidence {
-                caller_is_reflex_image: true,
-                ..all_true
-            },
-            false
-        ));
-        assert!(!should_replay_raw(
-            DispatchEvidence {
-                raw_syscall_found: false,
-                ..all_true
-            },
-            false
-        ));
-    }
-
-    #[cfg(feature = "artifact")]
-    #[test]
-    fn artifact_policy_does_not_apply_reflex_iat_or_caller_filters() {
-        let evidence = DispatchEvidence {
-            original_dispatcher_known: true,
-            stub_match: false,
-            caller_is_reflex_image: true,
-            raw_syscall_found: true,
-        };
-        assert!(should_replay_raw(evidence, true));
-        assert!(!should_replay_raw(evidence, false));
-        assert!(!should_replay_raw(
-            DispatchEvidence {
-                original_dispatcher_known: false,
-                ..evidence
-            },
-            true
-        ));
-        assert!(!should_replay_raw(
-            DispatchEvidence {
-                raw_syscall_found: false,
-                ..evidence
-            },
-            true
-        ));
-    }
-
     #[cfg(all(feature = "artifact", not(miri)))]
     struct WineCallStub {
         code: Box<[u8; 256]>,
@@ -1005,17 +450,6 @@ mod tests {
 
         fn raw_address(&self) -> u64 {
             (unsafe { self.code.as_ptr().add(Self::START + 0x12) }) as u64
-        }
-    }
-
-    #[cfg(all(feature = "artifact", not(miri)))]
-    impl Drop for WineCallStub {
-        fn drop(&mut self) {
-            super::super::reflex_markers::cancel(
-                unsafe { libc::gettid() as u64 },
-                self.stack.as_ptr() as u64 + 8,
-                self.raw_address() + 2,
-            );
         }
     }
 
@@ -1230,15 +664,13 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "artifact", not(miri)))]
+    #[cfg(not(miri))]
     #[test]
-    fn artifact_dispatcher_routes_when_reflex_marker_table_is_saturated() {
+    fn artifact_dispatcher_roundtrip_and_reused_site() {
         use std::time::{Duration, Instant};
 
-        const CHILD_ENV: &str = "ARTITUX_UNIT_ARTIFACT_SATURATION_CHILD";
+        const CHILD_ENV: &str = "ARTITUX_UNIT_ARTIFACT_ROUNDTRIP_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
-            // This exact test was self-execed in an isolated test process.
-            // Filling its real marker table cannot starve parallel tests.
             let fixture = WineCallStub::new();
             let mut signal_fixture = super::super::sigsys_router::artifact_tests::Fixture::new(2);
             let rsp = fixture.stack.as_ptr() as u64 + 8;
@@ -1246,21 +678,9 @@ mod tests {
             let recognized =
                 super::find_artifact_wine_syscall(fixture.stack[0], WineCallStub::SERVICE)
                     == Some(expected);
-            let mut saturated = false;
-            for index in 0..65_536u64 {
-                let tid = 0xf000_0000_0000_0000 | (index + 1);
-                let stack = 0x1000 + index * 16;
-                let rip = 0x2000 + index * 16;
-                if !super::super::reflex_markers::remember_marker(tid, stack, rip) {
-                    saturated = true;
-                    break;
-                }
-            }
             let selected = fixture.select(WineCallStub::SERVICE, WineCallStub::ORIGINAL, true);
             let status = if !recognized {
                 12
-            } else if !saturated {
-                10
             } else if selected != (expected | super::RAW_TARGET_TAG) {
                 11
             } else {
@@ -1286,7 +706,7 @@ mod tests {
 
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("syscall::kuser_dispatch::tests::artifact_dispatcher_routes_when_reflex_marker_table_is_saturated")
+            .arg("syscall::kuser_dispatch::tests::artifact_dispatcher_roundtrip_and_reused_site")
             .arg("--nocapture")
             .env(CHILD_ENV, "1")
             .env_remove("ARTITUX_DEBUG")
@@ -1302,18 +722,11 @@ mod tests {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("marker saturation child timed out");
+                panic!("artifact roundtrip child timed out");
             }
             std::thread::sleep(Duration::from_millis(5));
         };
-        assert_eq!(
-            status.code(),
-            Some(42),
-            "child status: 10=not saturated, 11=Wine fallback, 12=invalid stub, \
-             13=route declined, 14=callback ABI, 15=bypass handled, \
-             16=flags/request not restored, 17=FPU state, 18=fork failure, \
-             19=forked child inherited pending flags, 20-24=reused-site failure"
-        );
+        assert_eq!(status.code(), Some(42));
     }
 
     #[cfg(all(feature = "artifact", not(miri)))]

@@ -47,7 +47,7 @@ impl SessionCoordinator {
         if !self.is_active(pid) {
             return None;
         }
-        self.state.route_syscall().map(|route| route.target)
+        self.state.route_syscall()
     }
 
     fn cpuid(

@@ -3,10 +3,7 @@
 //! be mapped fails a syscall instead of faulting. Safe to use from the
 //! SIGSEGV/SIGSYS handlers. The current PID is queried for every operation:
 //! raw `SYS_fork` bypasses pthread-atfork handlers and invalidates PID caches.
-#![cfg_attr(
-    not(all(feature = "syscall", feature = "kuser", feature = "reflex")),
-    allow(dead_code)
-)]
+#![allow(dead_code)]
 
 use core::ffi::c_void;
 

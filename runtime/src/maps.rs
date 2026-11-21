@@ -13,7 +13,7 @@ const LINE_CAPACITY: usize = 1024;
 
 /// One parsed `/proc/self/maps` line. `path` is everything after the inode,
 /// spaces included (Steam library paths often contain them).
-#[cfg_attr(not(feature = "kuser"), allow(dead_code))]
+#[cfg_attr(not(feature = "artifact"), allow(dead_code))]
 pub(crate) struct Mapping<'a> {
     pub(crate) start: u64,
     pub(crate) end: u64,

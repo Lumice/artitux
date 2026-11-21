@@ -56,46 +56,6 @@ static FALLBACK_SKIP_LOGGED: AtomicU64 = AtomicU64::new(0);
 unsafe extern "C" {
     fn debug_log_hex(prefix: *const core::ffi::c_char, value: u64);
 }
-#[cfg(all(feature = "debug", feature = "reflex"))]
-unsafe extern "C" {
-    fn debug_log(message: *const core::ffi::c_char);
-}
-
-/// Capture the same window-list request before it enters our private syscall
-/// trampoline, so its arguments can be compared with the SIGSYS-side trace.
-#[cfg(all(feature = "debug", feature = "reflex"))]
-fn trace_window_list_entry(gregs: *const libc::greg_t) {
-    static EVENTS: AtomicU64 = AtomicU64::new(0);
-    let register = |index: libc::c_int| unsafe { gregs.add(index as usize).read() as u64 };
-    if register(libc::REG_RAX) != 0x132d || EVENTS.fetch_add(1, Ordering::Relaxed) >= 16 {
-        return;
-    }
-    let rsp = register(libc::REG_RSP);
-    unsafe {
-        debug_log(c"window list before INT 2E emulation".as_ptr());
-        debug_log_hex(
-            c"window list original RIP=".as_ptr(),
-            register(libc::REG_RIP),
-        );
-        debug_log_hex(c"window list original RSP=".as_ptr(), rsp);
-        debug_log_hex(
-            c"window list original R10=".as_ptr(),
-            register(libc::REG_R10),
-        );
-        debug_log_hex(
-            c"window list original RDX=".as_ptr(),
-            register(libc::REG_RDX),
-        );
-        debug_log_hex(c"window list original R8=".as_ptr(), register(libc::REG_R8));
-        debug_log_hex(c"window list original R9=".as_ptr(), register(libc::REG_R9));
-        if let Some(value) = crate::procmem::read_u64(rsp.saturating_add(0x38)) {
-            debug_log_hex(c"window list original stack+0x38=".as_ptr(), value);
-        }
-        if let Some(value) = crate::procmem::read_u64(rsp.saturating_add(0x40)) {
-            debug_log_hex(c"window list original stack+0x40=".as_ptr(), value);
-        }
-    }
-}
 
 fn next_instruction(rip: u64) -> Option<u64> {
     rip.checked_add(INT2E_INSTRUCTION.len() as u64)
@@ -238,9 +198,6 @@ pub(crate) unsafe fn skip_int2e_fault(context: *mut ucontext_t) -> bool {
     if !read_memory(rip, &mut instruction) || instruction != INT2E_INSTRUCTION {
         return false;
     }
-
-    #[cfg(all(feature = "debug", feature = "reflex"))]
-    trace_window_list_entry(gregs);
 
     if let Some(syscall_rip) = preceding_direct_syscall(rip) {
         unsafe {

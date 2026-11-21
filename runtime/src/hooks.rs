@@ -608,11 +608,7 @@ unsafe fn install_bridge(
         };
         unsafe { ptr::copy_nonoverlapping(source, oldact, 1) };
     }
-    #[cfg(feature = "kuser")]
-    crate::kuser::force_direct_syscall();
     if sig == libc::SIGSEGV {
-        #[cfg(feature = "kuser")]
-        crate::kuser::prepare_shared_page();
         if first_install {
             unsafe {
                 detect_cpu_vendor();

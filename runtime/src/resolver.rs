@@ -1,4 +1,5 @@
-//! Opt-in resolver re-entry compatibility bridge.
+//! Resolver re-entry compatibility bridge (enabled by default;
+//! `ARTITUX_RESOLVER_BRIDGE=0` disables it for diagnosis).
 #![cfg_attr(test, allow(dead_code))]
 use crate::errno::Errno;
 #[cfg(test)]

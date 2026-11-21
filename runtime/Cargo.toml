@@ -1,9 +1,9 @@
 [package]
 name = "artitux-runtime"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2024"
 rust-version.workspace = true
-description = "Linux x86_64 runtime for the Artitux Rust migration"
+description = "Linux x86_64 preload runtime for Artitux"
 license-file = "../LICENSE"
 publish = false
 
@@ -11,14 +11,13 @@ publish = false
 crate-type = ["rlib", "staticlib"]
 
 [features]
-default = ["cpuid", "hooks", "reflex", "syscall", "kuser", "faketime", "gamescope", "debug", "environment", "artifact"]
+default = ["cpuid", "hooks", "syscall", "kuser", "faketime", "gamescope", "debug", "environment", "artifact"]
 cpuid = []
 hooks = []
-reflex = []
 syscall = []
 kuser = []
-artifact = ["cpuid", "hooks", "reflex", "syscall", "kuser", "environment"]
-faketime = ["kuser"]
+artifact = ["cpuid", "hooks", "syscall", "kuser", "environment"]
+faketime = []
 gamescope = []
 debug = []
 environment = []
